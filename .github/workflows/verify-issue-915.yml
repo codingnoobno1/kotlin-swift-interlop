@@ -14,14 +14,17 @@ concurrency:
 jobs:
   build-and-test:
     name: Build and test async exception preservation
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
+    container:
+      image: swift:6.3-noble
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Install Swift
-        uses: swift-actions/setup-swift@v2
-        with:
-          swift-version: "6.3"
+      - name: Mark workspace as safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Show Swift version
+        run: swift --version
 
       - name: Install JDK 25
         uses: actions/setup-java@v5
@@ -30,7 +33,25 @@ jobs:
           java-version: "25"
 
       - name: Build
-        run: swift build --disable-experimental-prebuilts
+        run: |
+          set -o pipefail
+          swift build 2>&1 | tee build.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            tail -c 3500 build.log | awk '{ gsub(/%/,"%25"); gsub(/\r/,"%0D"); printf "%s%%0A", $0 }' > /tmp/ann.txt
+            echo "::error::swift build failed%0A$(cat /tmp/ann.txt)"
+            exit "$status"
+          fi
 
       - name: Test issue 915
-        run: swift test --filter asyncFailurePreservesJavaExceptionCause --disable-experimental-prebuilts
+        run: |
+          set -o pipefail
+          swift test --filter asyncFailurePreservesJavaExceptionCause 2>&1 | tee test.log
+          status=${PIPESTATUS[0]}
+          tail -c 3500 test.log | awk '{ gsub(/%/,"%25"); gsub(/\r/,"%0D"); printf "%s%%0A", $0 }' > /tmp/ann.txt
+          if [ "$status" -ne 0 ]; then
+            echo "::error::issue 915 test failed%0A$(cat /tmp/ann.txt)"
+          else
+            echo "::notice::issue 915 test passed%0A$(cat /tmp/ann.txt)"
+          fi
+          exit "$status"
