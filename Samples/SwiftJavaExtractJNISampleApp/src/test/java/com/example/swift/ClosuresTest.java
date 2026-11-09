@@ -1,0 +1,179 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2024 Apple Inc. and the Swift.org project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift.org project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+package com.example.swift;
+
+import org.junit.jupiter.api.Test;
+
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+public class ClosuresTest {
+    @Test
+    void emptyClosure() {
+        AtomicBoolean closureCalled = new AtomicBoolean(false);
+        MySwiftLibrary.emptyClosure(() -> {
+            closureCalled.set(true);
+        });
+        assertTrue(closureCalled.get());
+    }
+
+    @Test
+    void closureWithInt() {
+        // snippet.closureWithIntUsageJava
+        long result = MySwiftLibrary.closureWithInt(10, (value) -> value * 2);
+        assertEquals(20, result);
+        // snippet.end
+    }
+
+    @Test
+    void closureMultipleArguments() {
+        // snippet.closureMultipleArgumentsUsageJava
+        long result = MySwiftLibrary.closureMultipleArguments(5, 10, (a, b) -> a + b);
+        assertEquals(15, result);
+        // snippet.end
+    }
+
+    @Test
+    void globalCallMeBooleanSupplier() {
+        // snippet.closureUsageJava
+        boolean result = MySwiftLibrary.globalCallMeBooleanSupplier(() -> true);
+        assertEquals(true, result);
+        // snippet.end
+    }
+
+    @Test
+    void globalCallMeIntSupplier() {
+        int result = MySwiftLibrary.globalCallMeIntSupplier(() -> 2);
+        assertEquals(2, result);
+    }
+
+    @Test
+    void globalCallMeLongSupplier() {
+        long result = MySwiftLibrary.globalCallMeLongSupplier(() -> 2L);
+        assertEquals(2L, result);
+    }
+
+    @Test
+    void globalCallMeDoubleSupplier() {
+        double result = MySwiftLibrary.globalCallMeDoubleSupplier(() -> 2.0);
+        assertEquals(2.0, result);
+    }
+
+    @Test
+    void globalCallMeIntConsumer() {
+        MySwiftLibrary.globalCallMeIntConsumer((int a) -> {});
+    }
+
+    @Test
+    void globalCallMeLongConsumer() {
+        MySwiftLibrary.globalCallMeLongConsumer((long a) -> {});
+    }
+
+    @Test
+    void globalCallMeDoubleConsumer() {
+        MySwiftLibrary.globalCallMeDoubleConsumer((double a) -> {});
+    }
+
+    @Test
+    void globalCallMeIntPredicate() {
+        boolean result = MySwiftLibrary.globalCallMeIntPredicate((int a) -> { return true; });
+        assertEquals(true, result);
+    }
+
+    @Test
+    void globalCallMeLongPredicate() {
+        boolean result = MySwiftLibrary.globalCallMeLongPredicate((long a) -> { return true; });
+        assertEquals(true, result);
+    }
+
+    @Test
+    void globalCallMeDoublePredicate() {
+        boolean result = MySwiftLibrary.globalCallMeDoublePredicate((double a) -> { return true; });
+        assertEquals(true, result);
+    }
+
+    @Test
+    void globalCallMeIntUnaryOperator() {
+        int result = MySwiftLibrary.globalCallMeIntUnaryOperator((int a) -> { return a; });
+        assertEquals(1, result);
+    }
+
+    @Test
+    void globalCallMeLongUnaryOperator() {
+        long result = MySwiftLibrary.globalCallMeLongUnaryOperator((long a) -> { return a; });
+        assertEquals(1L, result);
+    }
+
+    @Test
+    void globalCallMeDoubleUnaryOperator() {
+        double result = MySwiftLibrary.globalCallMeDoubleUnaryOperator((double a) -> { return a; });
+        assertEquals(1.0, result);
+    }
+
+    @Test
+    void globalCallMeIntBinaryOperator() {
+        int result = MySwiftLibrary.globalCallMeIntBinaryOperator((int a, int b) -> { return a + b; });
+        assertEquals(3, result);
+    }
+
+    @Test
+    void globalCallMeLongBinaryOperator() {
+        long result = MySwiftLibrary.globalCallMeLongBinaryOperator((long a, long b) -> { return a + b; });
+        assertEquals(3L, result);
+    }
+
+    @Test
+    void globalCallMeDoubleBinaryOperator() {
+        double result = MySwiftLibrary.globalCallMeDoubleBinaryOperator((double a, double b) -> { return a + b; });
+        assertEquals(3.0, result);
+    }
+
+    @Test
+    void globalCallMeDoubleToIntFunction() {
+        int result = MySwiftLibrary.globalCallMeDoubleToIntFunction((double a) -> { return (int) a; });
+        assertEquals(1, result);
+    }
+
+    @Test
+    void globalCallMeLongToIntFunction() {
+        int result = MySwiftLibrary.globalCallMeLongToIntFunction((long a) -> { return (int) a; });
+        assertEquals(1, result);
+    }
+
+    @Test
+    void globalCallMeDoubleToLongFunction() {
+        long result = MySwiftLibrary.globalCallMeDoubleToLongFunction((double a) -> { return (long) a; });
+        assertEquals(1L, result);
+    }
+
+    @Test
+    void globalCallMeIntToLongFunction() {
+        long result = MySwiftLibrary.globalCallMeIntToLongFunction((int a) -> { return (long) a; });
+        assertEquals(1L, result);
+    }
+
+    @Test
+    void globalCallMeIntToDoubleFunction() {
+        double result = MySwiftLibrary.globalCallMeIntToDoubleFunction((int a) -> { return (double) a; });
+        assertEquals(1.0, result);
+    }
+
+    @Test
+    void globalCallMeLongToDoubleFunction() {
+        double result = MySwiftLibrary.globalCallMeLongToDoubleFunction((long a) -> { return (double) a; });
+        assertEquals(1.0, result);
+    }
+}

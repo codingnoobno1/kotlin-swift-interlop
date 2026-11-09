@@ -1,0 +1,53 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2024 Apple Inc. and the Swift.org project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift.org project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+import SwiftJavaJNICore
+
+extension AnyJavaObject {
+  /// Look up the other class type
+  ///
+  /// - Returns: `nil` when either `OtherClass` isn't known to the
+  ///   Java environment or this object isn't an instance of that type.
+  private func isInstanceOf<OtherClass: AnyJavaObject>(
+    _ otherClass: OtherClass.Type
+  ) -> jclass? {
+    guard let this: jobject = javaThisOptional else {
+      return nil
+    }
+    let environment = try! JavaVirtualMachine.shared().environment()
+
+    return try? otherClass.withJNIClass(in: environment) { otherJavaClass in
+      if environment.interface.IsInstanceOf(environment, this, otherJavaClass) == 0 {
+        return nil
+      }
+
+      return otherJavaClass
+    }
+  }
+
+  /// Determine whether this object is an instance of a specific
+  /// Java class.
+  public func `is`<OtherClass: AnyJavaObject>(_ otherClass: OtherClass.Type) -> Bool {
+    isInstanceOf(otherClass) != nil
+  }
+
+  /// Attempt to downcast this object to a specific Java class.
+  public func `as`<OtherClass: AnyJavaObject>(_ otherClass: OtherClass.Type) -> OtherClass? {
+    if `is`(otherClass) {
+      return OtherClass(javaHolder: javaHolder)
+    }
+
+    return nil
+  }
+}

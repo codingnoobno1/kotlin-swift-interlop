@@ -1,0 +1,1469 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2024 Apple Inc. and the Swift.org project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift.org project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+import JavaLangReflect
+import Logging
+import OrderedCollections
+import SwiftJava
+import SwiftJavaConfigurationShared
+import SwiftSyntax
+
+/// Utility type that translates a single Java class into its corresponding
+/// Swift type and any additional helper types or functions.
+struct JavaClassTranslator {
+  /// The translator we are working with, which provides global knowledge
+  /// needed for translation.
+  let translator: JavaTranslator
+
+  var log: Logger {
+    translator.log
+  }
+
+  /// The Java class (or interface) being translated.
+  let javaClass: JavaClass<JavaObject>
+
+  /// Whether to translate this Java class into a Swift class.
+  ///
+  /// This will be false for Java interfaces.
+  let translateAsClass: Bool
+
+  /// The type parameters to the Java class or interface.
+  let javaTypeParameters: [TypeVariable<JavaClass<JavaObject>>]
+
+  /// The set of nested classes of this class that will be rendered along
+  /// with it.
+  let nestedClasses: [JavaClass<JavaObject>]
+
+  /// The full name of the Swift type that will be generated for this Java
+  /// class.
+  let swiftTypeName: String
+
+  /// The effective Java superclass object, which is the nearest
+  /// superclass that has been mapped into Swift.
+  let effectiveJavaSuperclass: JavaClass<JavaObject>?
+
+  /// The Swift name of the superclass.
+  let swiftSuperclass: SwiftJavaParameterizedType?
+
+  /// The Swift names of the interfaces that this class implements.
+  let swiftInterfaces: [String]
+
+  /// Substitution map for resolving generic types.
+  let substitution: SubstitutionMap
+
+  /// The annotations of the Java class.
+  /// In other words, RUNTIME retained annotations, visible through reflection.
+  let annotations: [Annotation]
+
+  /// Annotations parsed from the .class file's RuntimeInvisibleAnnotations attribute.
+  /// These are CLASS retained annotations, not visible through reflection.
+  let runtimeInvisibleAnnotations: JavaRuntimeInvisibleAnnotations
+
+  /// The (instance) fields of the Java class.
+  var fields: [Field] = []
+
+  /// The static fields of the Java class.
+  var staticFields: [Field] = []
+
+  /// Enum constants of the Java class, which are also static fields and are
+  /// reflected additionally as enum cases.
+  var enumConstants: [Field] = []
+
+  /// Constructors of the Java class.
+  var constructors: [Constructor<JavaObject>] = []
+
+  /// The (instance) methods of the Java class.
+  var methods: MethodCollector = MethodCollector()
+
+  /// The static methods of the Java class.
+  var staticMethods: MethodCollector = MethodCollector()
+
+  /// The native instance methods of the Java class, which are also reflected
+  /// in a `*NativeMethods` protocol so they can be implemented in Swift.
+  var nativeMethods: [Method] = []
+
+  /// The native static methods of the Java class.
+  /// TODO: These are currently unimplemented.
+  var nativeStaticMethods: [Method] = []
+
+  /// Whether the Java class we're translating is actually an interface.
+  var isInterface: Bool {
+    javaClass.isInterface()
+  }
+
+  /// The name of the enclosing Swift type, if there is one.
+  var swiftParentType: String? {
+    swiftTypeName.splitSwiftTypeName().parentType
+  }
+
+  /// The name of the innermost Swift type, without the enclosing type.
+  var swiftInnermostTypeName: String {
+    swiftTypeName.splitSwiftTypeName().name
+  }
+
+  /// Prepare translation for the given Java class (or interface).
+  init(javaClass: JavaClass<JavaObject>, translator: JavaTranslator) throws {
+    let fullName = javaClass.getName()
+    self.javaClass = javaClass
+    self.translator = translator
+    self.translateAsClass = translator.translateAsClass && !javaClass.isInterface()
+    let swiftTypeName = try translator.getSwiftTypeNameFromJavaClassName(
+      fullName,
+      preferValueTypes: false,
+      escapeMemberNames: false
+    )
+    self.swiftTypeName = swiftTypeName
+
+    // Type parameters.
+    let javaTypeParameters = javaClass.getTypeParameters().compactMap { $0 }
+    self.javaTypeParameters = javaTypeParameters
+    self.nestedClasses = translator.nestedClasses[fullName] ?? []
+
+    // Generic substitution.
+    let substitution = SubstitutionMap(startingFrom: javaClass)
+    self.substitution = substitution
+
+    // Superclass, incl parameter types (if any)
+    if !javaClass.isInterface() {
+      var javaSuperclass = javaClass.getSuperclass()
+      if javaSuperclass != nil, translator.translatedClasses[JavaObject.fullJavaClassName] == nil {
+        throw TranslationError.untranslatedJavaClass(JavaObject.fullJavaClassName)
+      }
+
+      var javaGenericSuperclass: Type? = javaClass.getGenericSuperclass()
+      var swiftSuperclassName: String? = nil
+      var swiftSuperclassTypeArgs: [String]? = nil
+      while let javaSuperclassNonOpt = javaSuperclass {
+        do {
+          swiftSuperclassName = try translator.getSwiftTypeName(javaSuperclassNonOpt, preferValueTypes: false).swiftName
+          swiftSuperclassTypeArgs = try javaGenericSuperclass?.as(ParameterizedType.self)?.getActualTypeArguments()
+            .compactMap { typeArg in
+              guard let typeArg else { return nil }
+
+              // When forwarding generics to the superclass
+              if javaTypeParameters.contains(where: { $0.getName() == typeArg.getTypeName() }) {
+                return "\(swiftTypeName.splitSwiftTypeName().name)_\(typeArg.getTypeName())"
+              }
+
+              return try translator.getSwiftTypeNameAsString(
+                typeArg,
+                substitution: substitution,
+                preferValueTypes: false,
+                outerOptional: .nonoptional
+              )
+            }
+          break
+        } catch {
+          translator.logUntranslated("Unable to translate '\(fullName)' superclass: \(error)")
+        }
+
+        javaSuperclass = javaSuperclassNonOpt.getSuperclass()
+        javaGenericSuperclass = javaSuperclassNonOpt.getGenericSuperclass()
+      }
+
+      self.effectiveJavaSuperclass = javaSuperclass
+      self.swiftSuperclass = SwiftJavaParameterizedType(
+        name: swiftSuperclassName,
+        typeArguments: swiftSuperclassTypeArgs
+      )
+    } else {
+      self.effectiveJavaSuperclass = nil
+      self.swiftSuperclass = nil
+    }
+
+    // Interfaces.
+    self.swiftInterfaces = javaClass.getGenericInterfaces().compactMap { (javaType) -> String? in
+      guard let javaType else {
+        return nil
+      }
+
+      do {
+        return try translator.getSwiftTypeNameAsString(
+          javaType,
+          substitution: nil,
+          preferValueTypes: false,
+          outerOptional: .nonoptional,
+          eraseTypeArguments: true
+        )
+      } catch {
+        translator.logUntranslated("Unable to translate '\(fullName)' interface '\(javaType.getTypeName())': \(error)")
+        return nil
+      }
+    }
+
+    self.annotations = javaClass.getAnnotations().compactMap(\.self)
+
+    // Parse RuntimeInvisibleAnnotations (CLASS-retention) from .class bytes.
+    let resourcePath = fullName.replacing(".", with: "/") + ".class" // must not have leading `/`
+    if let inputStream = javaClass.getClassLoader()?.getResourceAsStream(resourcePath) {
+      do {
+        let bytes = try inputStream.readAllBytes()
+        self.runtimeInvisibleAnnotations = JavaClassFileReader.parseRuntimeInvisibleAnnotations(
+          bytes.map { UInt8(bitPattern: $0) }
+        )
+        let classCount = self.runtimeInvisibleAnnotations.classAnnotations.count
+        let methodCount = self.runtimeInvisibleAnnotations.methodAnnotations.count
+        let fieldCount = self.runtimeInvisibleAnnotations.fieldAnnotations.count
+        translator.log.debug("Parsed runtime invisible annotations for '\(fullName)': \(classCount) class, \(methodCount) method, \(fieldCount) field")
+      } catch {
+        translator.log.warning("Failed to read .class bytes for '\(fullName)': \(error)")
+        self.runtimeInvisibleAnnotations = JavaRuntimeInvisibleAnnotations()
+      }
+    } else {
+      translator.log.warning("Could not get resource stream for '\(resourcePath)'")
+      self.runtimeInvisibleAnnotations = JavaRuntimeInvisibleAnnotations()
+    }
+
+    // Collect all of the class members that we will need to translate.
+    // TODO: Switch over to "declared" versions of these whenever we don't need
+    // to see inherited members.
+
+    // Gather fields.
+    for field in javaClass.getFields() {
+      guard let field else { continue }
+      addField(field)
+    }
+
+    // Gather constructors.
+    for constructor in javaClass.getConstructors() {
+      guard let constructor else { continue }
+      addConstructor(constructor)
+    }
+
+    // Gather methods.
+    let methods =
+      translateAsClass
+      ? javaClass.getDeclaredMethods()
+      : javaClass.getMethods()
+    for method in methods {
+      guard let method else { continue }
+
+      guard shouldExtract(method: method, config: translator.config) else {
+        continue
+      }
+
+      // Skip any methods that are expected to be implemented in Swift. We will
+      // visit them in the second pass, over the *declared* methods, because
+      // we want to see non-public methods as well.
+      let implementedInSwift =
+        method.isNative && method.getDeclaringClass()!.equals(javaClass.as(JavaObject.self)!)
+        && translator.swiftNativeImplementations.contains(javaClass.getName())
+      if implementedInSwift {
+        continue
+      }
+
+      addMethod(method, isNative: false)
+    }
+
+    if translator.swiftNativeImplementations.contains(javaClass.getName()) {
+      // Gather the native methods we're going to implement.
+      for method in javaClass.getDeclaredMethods() {
+        guard let method else { continue }
+
+        // Only visit native methods in this second pass.
+        if !method.isNative {
+          continue
+        }
+
+        addMethod(method, isNative: true)
+      }
+    }
+  }
+}
+
+/// MARK: Collection of Java class members.
+extension JavaClassTranslator {
+
+  /// Determines whether a method should be extracted for translation.
+  /// Only look at public and protected methods here.
+  private func shouldExtract(method: Method, config: Configuration) -> Bool {
+    // Check exclude filters, if they're applicable to methods:
+    for exclude in config.javaFilterExclude ?? [] where exclude.contains("#") {
+      let split = exclude.split(separator: "#")
+      guard split.count == 2 else {
+        self.log.warning("Malformed method exclude filter, must have only one '#' marker: \(exclude)")
+        continue // cannot use this filter, malformed
+      }
+
+      let javaClassName = method.getDeclaringClass().getName()
+      let javaMemberName = method.getName()
+
+      let className = split.first!
+      let excludedName = split.dropFirst().first!
+
+      if javaClassName.starts(with: className) {
+        if excludedName.hasSuffix("*"), javaMemberName.starts(with: excludedName.dropLast()) {
+          log.info("Skip Java member '\(javaClassName)#\(javaMemberName)', prefix exclude matched: \(exclude)")
+          return false
+        } else if javaMemberName == excludedName {
+          log.info("Skip Java member '\(javaClassName)#\(javaMemberName)', exact exclude matched: \(exclude)")
+          return false
+        }
+      }
+    }
+
+    switch self.translator.config.effectiveMinimumInputAccessLevelMode {
+    case .internal:
+      return method.isPublic || method.isProtected || method.isPackage
+    case .package:
+      return method.isPublic || method.isProtected || method.isPackage
+    case .public:
+      return method.isPublic || method.isProtected
+    }
+  }
+
+  /// Add a field to the appropriate lists(s) for later translation.
+  private mutating func addField(_ field: Field) {
+    // Don't include inherited fields when translating to a class.
+    // This applies to both instance and static fields to avoid duplicates
+    if translateAsClass && !field.getDeclaringClass()!.equals(javaClass.as(JavaObject.self)!) {
+      return
+    }
+
+    // Static fields go into a separate list.
+    if field.isStatic {
+      // Deduplicate by name: getFields() can return the same field from both an
+      // interface and its super-interface (e.g. serialVersionUID on Key and PublicKey).
+      guard !staticFields.contains(where: { $0.getName() == field.getName() }) else {
+        return
+      }
+      staticFields.append(field)
+
+      // Enum constants will be used to produce a Swift enum projecting the
+      // Java enum.
+      if field.isEnumConstant() {
+        enumConstants.append(field)
+      }
+
+      return
+    }
+
+    fields.append(field)
+  }
+
+  /// Add a constructor to the list of constructors for later translation.
+  private mutating func addConstructor(_ constructor: Constructor<JavaObject>) {
+    constructors.append(constructor)
+  }
+
+  /// Add a method to the appropriate list for later translation.
+  private mutating func addMethod(_ method: Method, isNative: Bool) {
+    switch (method.isStatic, isNative) {
+    case (false, false): methods.add(method)
+    case (true, false): staticMethods.add(method)
+    case (false, true): nativeMethods.append(method)
+    case (true, true): nativeStaticMethods.append(method)
+    }
+  }
+}
+
+/// MARK: Rendering of Java class members as Swift declarations.
+extension JavaClassTranslator {
+  /// Render the Swift declarations that will express this Java class in Swift.
+  package func render() -> [DeclSyntax] {
+    var allDecls: [DeclSyntax] = []
+    if let staticMemberExtension = renderStaticMemberExtension() {
+      allDecls.append(staticMemberExtension)
+    }
+    allDecls.append(renderPrimaryType())
+    allDecls.append(contentsOf: renderNestedClasses())
+    if let nativeMethodsProtocol = renderNativeMethodsProtocol() {
+      allDecls.append(nativeMethodsProtocol)
+    }
+    allDecls.append(contentsOf: renderAnnotationExtensions())
+    return allDecls
+  }
+
+  /// Render additional documentation about the Java type, e.g. if it was a `sealed` type, etc.
+  private func renderJavaKindDocc() -> String {
+    var lines: [String] = []
+    if javaClass.isRecord() {
+      lines.append("/// Java record: `\(javaClass.getName())`")
+    }
+    if javaClass.isSealed() {
+      let kind = javaClass.isInterface() ? "sealed interface" : "sealed class"
+      let permits = javaClass.getPermittedSubclasses().compactMap { $0?.getName() }
+      if permits.isEmpty {
+        lines.append("/// Java `\(kind)`")
+      } else {
+        lines.append("/// Java `\(kind)`, permits: \(permits.map({ "`\($0)`" }).joined(separator: ", "))")
+      }
+      log.info("Wrap Java \(kind): `\(javaClass.getName())`, permits: \(permits.map({ "`\($0)`" }).joined(separator: ", ")))")
+    }
+    if lines.isEmpty {
+      return ""
+    }
+    return lines.joined(separator: "\n") + "\n"
+  }
+
+  /// Render the declaration for the main part of the Java class, which
+  /// includes the constructors, non-static fields, and non-static methods.
+  private func renderPrimaryType() -> DeclSyntax {
+    // Render all of the instance fields as Swift properties.
+    let properties = fields.sortedForEmission().compactMap { field in
+      do {
+        return try renderField(field)
+      } catch {
+        translator.logUntranslated(
+          "Unable to translate '\(javaClass.getName())' static field '\(field.getName())': \(error)"
+        )
+        return nil
+      }
+    }
+
+    // Declarations used to capture Java enums.
+    let enumDecls: [DeclSyntax] = renderEnum(name: "\(swiftInnermostTypeName)Cases")
+
+    // Render all of the constructors as Swift initializers.
+    let initializers = constructors.sortedForEmission().compactMap { constructor in
+      do {
+        return try renderConstructor(constructor)
+      } catch {
+        translator.logUntranslated("Unable to translate '\(javaClass.getName())' constructor: \(error)")
+        return nil
+      }
+    }
+
+    // Render all of the instance methods in Swift.
+    let instanceMethods = methods.methods.sortedForEmission().compactMap { method in
+      do {
+        return try renderMethod(method, implementedInSwift: false)
+      } catch {
+        translator.logUntranslated(
+          "Unable to translate '\(javaClass.getName())' method '\(method.getName())': \(error)"
+        )
+        return nil
+      }
+    }
+
+    let swiftGenericParameterNames = javaTypeParameters.map { param in
+      "\(swiftInnermostTypeName)_\(param.getName())"
+    }
+    let genericParameterTypeAliases: [DeclSyntax] = zip(javaTypeParameters, swiftGenericParameterNames)
+      .map { javaDecl, swiftName in
+        DeclSyntax("public typealias \(raw: javaDecl.getName()) = \(raw: swiftName)")
+      }
+
+    // Collect all of the members of this type.
+    let members = genericParameterTypeAliases + initializers + properties + enumDecls + instanceMethods
+
+    // Compute the "extends" clause for the superclass (of the struct
+    // formulation) or the inheritance clause (for the class
+    // formulation).
+    let extendsClause: String
+    let inheritanceClause: String
+    if translateAsClass {
+      extendsClause = ""
+      inheritanceClause =
+        if let swiftSuperclass, swiftSuperclass.typeArguments.isEmpty {
+          ": \(swiftSuperclass.name)"
+        } else if let swiftSuperclass {
+          ": \(swiftSuperclass.name)<\(swiftSuperclass.typeArguments.joined(separator: ", "))>"
+        } else {
+          ""
+        }
+    } else {
+      extendsClause =
+        if let swiftSuperclass {
+          ", extends: \(swiftSuperclass.render()).self"
+        } else {
+          ""
+        }
+      inheritanceClause = ""
+    }
+
+    // Compute the string to capture all of the interfaces.
+    let interfacesStr: String
+    if swiftInterfaces.isEmpty {
+      interfacesStr = ""
+    } else {
+      let prefix = javaClass.isInterface() ? "extends" : "implements"
+      interfacesStr = ", \(prefix): \(swiftInterfaces.map { "\($0).self" }.joined(separator: ", "))"
+    }
+
+    let genericParameterClause =
+      if swiftGenericParameterNames.isEmpty {
+        ""
+      } else {
+        "<\(swiftGenericParameterNames.map({ "\($0): AnyJavaObject" }).joined(separator: ", "))>"
+      }
+
+    // Emit the struct declaration describing the java class.
+    // Records are wrapped like classes today, but tagged with @JavaRecord so the
+    // "was a record" signal survives into the generated Swift and downstream tools.
+    let classOrInterface: String =
+      if isInterface {
+        "JavaInterface"
+      } else if javaClass.isRecord() {
+        "JavaRecord"
+      } else {
+        "JavaClass"
+      }
+    let introducer = translateAsClass ? "open class" : "public struct"
+    let classAvailableAttributes = swiftAvailableAttributes(
+      from: annotations,
+      runtimeInvisibleAnnotations: self.runtimeInvisibleAnnotations.classAnnotations,
+      javaClass: javaClass
+    )
+    let javaKindDocs = renderJavaKindDocc()
+    var classDecl: DeclSyntax =
+      """
+      \(raw: javaKindDocs)\(raw: classAvailableAttributes.render())@\(raw: classOrInterface)(\(literal: javaClass.getName())\(raw: extendsClause)\(raw: interfacesStr))
+      \(raw: introducer) \(raw: swiftInnermostTypeName)\(raw: genericParameterClause)\(raw: inheritanceClause) {
+      \(raw: members.map { $0.description }.joined(separator: "\n\n"))
+      }
+      """
+
+    // If there is a parent type, wrap this type up in an extension of that
+    // parent type.
+    if let swiftParentType {
+      classDecl =
+        """
+        extension \(raw: swiftParentType) {
+          \(classDecl)
+        }
+        """
+    }
+
+    // Format the class declaration.
+    return classDecl.formatted(using: translator.format).cast(DeclSyntax.self)
+  }
+
+  /// Render any nested classes that will not be rendered separately.
+  func renderNestedClasses() -> [DeclSyntax] {
+    nestedClasses
+      .sorted {
+        $0.getName() < $1.getName()
+      }.compactMap { clazz in
+        do {
+          return try translator.translateClass(clazz)
+        } catch {
+          translator.logUntranslated(
+            "Unable to translate '\(javaClass.getName())' nested class '\(clazz.getName())': \(error)"
+          )
+          return nil
+        }
+      }.flatMap(\.self)
+  }
+
+  /// Render the extension of JavaClass that collects all of the static
+  /// fields and methods.
+  package func renderStaticMemberExtension(asCrossModuleExtension: Bool = false) -> DeclSyntax? {
+    // Determine the where clause we need for static methods.
+    let staticMemberWhereClause: String
+    if !javaTypeParameters.isEmpty {
+      let genericParameterNames = javaTypeParameters.compactMap { typeVar in
+        typeVar.getName()
+      }
+
+      let genericArgumentClause = "<\(genericParameterNames.joined(separator: ", "))>"
+      staticMemberWhereClause = " where ObjectType == \(swiftTypeName)\(genericArgumentClause)" // FIXME: move the 'where ...' part into the render bit
+    } else {
+      staticMemberWhereClause = ""
+    }
+
+    // Render static fields.
+    let properties = staticFields.sortedForEmission().compactMap { field -> DeclSyntax? in
+      // Translate each static field.
+      guard !asCrossModuleExtension || referencesCurrentModule(field) else {
+        return nil
+      }
+      do {
+        return try renderField(field)
+      } catch {
+        translator.logUntranslated("Unable to translate '\(javaClass.getName())' field '\(field.getName())': \(error)")
+        return nil
+      }
+    }
+
+    // Render static methods.
+    let methods = staticMethods.methods.sortedForEmission().compactMap { method -> DeclSyntax? in
+      // Translate each static method.
+      guard !asCrossModuleExtension || referencesCurrentModule(method) else {
+        return nil
+      }
+      do {
+        return try renderMethod(
+          method,
+          implementedInSwift: /*FIXME:*/ false,
+          genericParameters: javaTypeParameters.map { param in
+            "\(param.getName()): AnyJavaObject"
+          },
+          whereClause: staticMemberWhereClause
+        )
+      } catch {
+        translator.logUntranslated(
+          "Unable to translate '\(javaClass.getName())' static method '\(method.getName())': \(error)"
+        )
+        return nil
+      }
+    }
+
+    // Gather all of the members.
+    let members = properties + methods
+    if members.isEmpty {
+      return nil
+    }
+
+    // Specify the specialization arguments when needed.
+    let extSpecialization: String
+    if javaTypeParameters.isEmpty {
+      extSpecialization = "<\(swiftTypeName)>"
+    } else {
+      extSpecialization = ""
+    }
+
+    let extDecl: DeclSyntax =
+      """
+      extension JavaClass\(raw: extSpecialization) {
+      \(raw: members.map { $0.description }.joined(separator: "\n\n"))
+      }
+      """
+
+    return extDecl.formatted(using: translator.format).cast(DeclSyntax.self)
+  }
+
+  private func owningModule(of javaClass: JavaClass<JavaObject>?) -> String? {
+    guard var javaClass else { return nil }
+    while javaClass.isArray() {
+      guard let component = javaClass.getComponentType() else { break }
+      javaClass = component
+    }
+    return translator.translatedClasses[javaClass.getName()]?.swiftModule
+  }
+
+  /// Whether this method references at least one Java type whose Swift wrapper
+  /// is owned by the module currently being generated.
+  private func referencesCurrentModule(_ types: [JavaClass<JavaObject>?]) -> Bool {
+    types.contains { owningModule(of: $0) == translator.swiftModuleName }
+  }
+  private func referencesCurrentModule(_ method: Method) -> Bool {
+    referencesCurrentModule([method.getReturnType()] + method.getParameterTypes())
+  }
+  private func referencesCurrentModule(_ constructor: Constructor<JavaObject>) -> Bool {
+    referencesCurrentModule(constructor.getParameterTypes())
+  }
+  private func referencesCurrentModule(_ field: Field) -> Bool {
+    referencesCurrentModule([field.getType()])
+  }
+
+  package func renderCrossModuleExtension() -> [DeclSyntax] {
+    guard let extendedSwiftName: String = translator.translatedClasses[javaClass.getName()]?.swiftType else {
+      return []
+    }
+
+    var decls: [DeclSyntax] = []
+    if let staticExtension = renderStaticMemberExtension(asCrossModuleExtension: true) {
+      decls.append(staticExtension)
+    }
+    if let instanceExtension = renderCrossModuleInstanceExtension(of: extendedSwiftName) {
+      decls.append(instanceExtension)
+    }
+    return decls
+  }
+
+  private func renderCrossModuleInstanceExtension(of extendedSwiftName: String) -> DeclSyntax? {
+    let initializers: [DeclSyntax] = constructors.sortedForEmission().compactMap { constructor -> DeclSyntax? in
+      guard referencesCurrentModule(constructor) else {
+        return nil
+      }
+      do {
+        return try renderConstructor(constructor)
+      } catch {
+        translator.logUntranslated("Unable to translate '\(javaClass.getName())' constructor: \(error)")
+        return nil
+      }
+    }
+
+    let renderedMethods: [DeclSyntax] = methods.methods.sortedForEmission().compactMap { method -> DeclSyntax? in
+      guard referencesCurrentModule(method) else {
+        return nil
+      }
+      do {
+        return try renderMethod(method, implementedInSwift: false, asCrossModuleExtensionMember: true)
+      } catch {
+        translator.logUntranslated(
+          "Unable to translate '\(javaClass.getName())' method '\(method.getName())': \(error)"
+        )
+        return nil
+      }
+    }
+
+    let members = initializers + renderedMethods
+    if members.isEmpty {
+      return nil
+    }
+
+    let extDecl: DeclSyntax =
+      """
+      extension \(raw: extendedSwiftName) {
+      \(raw: members.map { $0.description }.joined(separator: "\n\n"))
+      }
+      """
+
+    return extDecl.formatted(using: translator.format).cast(DeclSyntax.self)
+  }
+
+  /// Render the protocol used for native methods.
+  func renderNativeMethodsProtocol() -> DeclSyntax? {
+    guard translator.swiftNativeImplementations.contains(javaClass.getName()) else {
+      return nil
+    }
+
+    let nativeMembers = nativeMethods.sortedForEmission().compactMap { method in
+      do {
+        return try renderMethod(
+          method,
+          implementedInSwift: true
+        )
+      } catch {
+        translator.logUntranslated(
+          "Unable to translate '\(javaClass.getName())' method '\(method.getName())': \(error)"
+        )
+        return nil
+      }
+    }
+
+    if nativeMembers.isEmpty {
+      return nil
+    }
+
+    let protocolDecl: DeclSyntax =
+      """
+      /// Describes the Java `native` methods for ``\(raw: swiftTypeName)``.
+      ///
+      /// To implement all of the `native` methods for \(raw: swiftTypeName) in Swift,
+      /// extend \(raw: swiftTypeName) to conform to this protocol and mark
+      /// each implementation of the protocol requirement with
+      /// `@JavaMethod`.
+      protocol \(raw: swiftTypeName)NativeMethods {
+        \(raw: nativeMembers.map { $0.description }.joined(separator: "\n\n"))
+      }
+      """
+
+    return protocolDecl.formatted(using: translator.format).cast(DeclSyntax.self)
+  }
+
+  /// A single Swift attribute derived from a Java annotation.
+  struct SwiftAttribute {
+    /// The attribute text, e.g. `@available(*, deprecated)`.
+    var value: String
+
+    /// The minimum Swift compiler version required to compile this attribute.
+    /// When non-nil the attribute is wrapped in a `#if compiler(>=…)` block during rendering.
+    var minimumCompilerVersion: SwiftVersion? = nil
+  }
+
+  struct SwiftAvailableAttributes {
+    var attributes: [SwiftAttribute] = []
+
+    func render() -> String {
+      if attributes.isEmpty {
+        return ""
+      }
+      var lines: [String] = []
+      for attr in attributes {
+        if let version = attr.minimumCompilerVersion {
+          let versionString =
+            version.patch.map { "\(version.major).\(version.minor).\($0)" }
+            ?? "\(version.major).\(version.minor)"
+          lines.append("#if compiler(>=\(versionString))")
+          lines.append(attr.value)
+          lines.append("#endif")
+        } else {
+          lines.append(attr.value)
+        }
+      }
+      return lines.joined(separator: "\n") + "\n"
+    }
+  }
+
+  private func apiLevelComment(_ level: Int32) -> String {
+    AndroidAPILevel(rawValue: Int(level)).map { " /* \($0.name) */" } ?? ""
+  }
+
+  private func availabilityFromBinRequiresApi(_ binAnnotation: JavaRuntimeInvisibleAnnotation) -> SwiftAttribute? {
+    let apiLevel: Int32? =
+      if let api = binAnnotation.elements["api"], api > 0 {
+        api
+      } else if let value = binAnnotation.elements["value"], value > 0 {
+        value
+      } else {
+        nil
+      }
+
+    guard let apiLevel else { return nil }
+    return SwiftAttribute(
+      value: "@available(Android \(apiLevel)\(apiLevelComment(apiLevel)), *)",
+      minimumCompilerVersion: .androidPlatformAvailability
+    )
+  }
+
+  /// Build Swift `@available` attributes from Java annotations on a reflective element.
+  private func swiftAvailableAttributes(
+    from runtimeAnnotations: [Annotation],
+    runtimeInvisibleAnnotations: [JavaRuntimeInvisibleAnnotation] = [],
+    javaClass: JavaClass<JavaObject>? = nil,
+    javaMethod: Method? = nil,
+    javaConstructor: Executable? = nil,
+    javaFieldName: String? = nil
+  ) -> SwiftAvailableAttributes {
+    var result = SwiftAvailableAttributes()
+
+    for annotation in runtimeAnnotations {
+      guard let annotationClass = annotation.annotationType() else { continue }
+
+      if annotationClass.isKnown(.javaLangDeprecated) {
+        result.attributes += [SwiftAttribute(value: "@available(*, deprecated)")]
+      }
+    }
+
+    // Look for any annotations stored in classfiles, e.g. the Android @
+    for binAnnotation in runtimeInvisibleAnnotations {
+      let fqn = binAnnotation.fullyQualifiedName
+
+      // Handle Android's RequiresApi; though they don't exist in android.jar (!)
+      if fqn == KnownJavaAnnotation.androidxRequiresApi.rawValue
+        || fqn == KnownJavaAnnotation.androidSupportRequiresApi.rawValue
+      {
+        if let attr = availabilityFromBinRequiresApi(binAnnotation) {
+          result.attributes += [attr]
+        }
+      }
+    }
+
+    // For android, the RequiresApi actually are synthetic and stored in api-versions.xml,
+    // so consult that if available
+    if let apiVersions = translator.androidAPIVersions, let javaClass {
+      let className = javaClass.getName()
+      let versionInfo: AndroidAPIAvailability? =
+        if let javaMethod {
+          apiVersions.versionInfo(forClass: className, methodDescriptor: jvmMethodDescriptor(javaMethod))
+        } else if let javaConstructor {
+          apiVersions.versionInfo(forClass: className, methodDescriptor: jvmMethodDescriptor(javaConstructor))
+        } else if let fieldName = javaFieldName {
+          apiVersions.versionInfo(forClass: className, fieldName: fieldName)
+        } else {
+          apiVersions.versionInfo(forClass: className)
+        }
+
+      if let info = versionInfo {
+        let alreadyHasAndroidAvailable = result.attributes.contains {
+          $0.value.contains("@available(Android")
+        }
+
+        // Only add since from api-versions.xml if @RequiresApi didn't already provide one.
+        if !alreadyHasAndroidAvailable, let since = info.since, since.rawValue > 0 {
+          result.attributes += [
+            SwiftAttribute(
+              value: "@available(Android \(since.rawValue) /* \(since.name) */, *)",
+              minimumCompilerVersion: .androidPlatformAvailability
+            )
+          ]
+        }
+
+        let alreadyHasDeprecated = result.attributes.contains {
+          $0.value.contains("deprecated")
+        }
+
+        // Handle deprecated APIs; also emit deprecated for removed APIs if not already deprecated.
+        if !alreadyHasDeprecated, let deprecated = info.deprecated {
+          result.attributes += [
+            SwiftAttribute(
+              value: "@available(Android, deprecated: \(deprecated.rawValue), message: \"Deprecated in Android API \(deprecated.rawValue) /* \(deprecated.name) */\")",
+              minimumCompilerVersion: .androidPlatformAvailability
+            )
+          ]
+        } else if !alreadyHasDeprecated, let removed = info.removed {
+          // Swift's '@available(Android, unavailable, ...' does not accept a version so we don't use it,
+          // since it may prevent calling an API that's actually still there in some Android version we're targeting.
+          result.attributes += [
+            SwiftAttribute(
+              value: "@available(Android, deprecated: \(removed.rawValue), message: \"Removed in Android API \(removed.rawValue) /* \(removed.name) */\")",
+              minimumCompilerVersion: .androidPlatformAvailability
+            )
+          ]
+        }
+      }
+    }
+
+    return result
+  }
+
+
+  func renderAnnotationExtensions() -> [DeclSyntax] {
+    var extensions: [DeclSyntax] = []
+
+    for annotation in annotations {
+      guard let annotationClass = annotation.annotationType() else { continue }
+      if annotationClass.isKnown(.threadSafe) || annotationClass.isKnown(.immutable) {
+        extensions.append(
+          """
+          extension \(raw: swiftTypeName): @unchecked Swift.Sendable { }
+          """
+        )
+      } else if annotationClass.isKnown(.notThreadSafe) {
+        extensions.append(
+          """
+          @available(unavailable, *)
+          extension \(raw: swiftTypeName): Swift.Sendable { }
+          """
+        )
+      }
+    }
+
+    return extensions
+  }
+
+  /// Render the given Java constructor as a Swift initializer.
+  package func renderConstructor(
+    _ javaConstructor: Constructor<some AnyJavaObject>
+  ) throws -> DeclSyntax {
+    let parameters: [FunctionParameterSyntax]
+    parameters = try translateJavaParameters(javaConstructor.getParameters()) + ["environment: JNIEnvironment? = nil"]
+    let parametersStr = parameters.map { $0.description }.joined(separator: ", ")
+    let throwsStr = javaConstructor.throwsCheckedException ? "throws" : ""
+    let accessModifier = javaConstructor.isPublic ? "public " : ""
+    let convenienceModifier = translateAsClass ? "convenience " : ""
+    let nonoverrideAttribute = translateAsClass ? "@_nonoverride " : ""
+    let constructorAnnotations = javaConstructor.getDeclaredAnnotations().compactMap(\.self)
+    let invisibleCtorAnnotations = runtimeInvisibleAnnotations.annotationsFor(constructor: javaConstructor)
+    let availableAttributes = swiftAvailableAttributes(
+      from: constructorAnnotations,
+      runtimeInvisibleAnnotations: invisibleCtorAnnotations,
+      javaClass: javaClass,
+      javaConstructor: javaConstructor
+    )
+
+    // FIXME: handle generics in constructors
+    return """
+      \(raw: availableAttributes.render())@JavaMethod
+      \(raw: nonoverrideAttribute)\(raw: accessModifier)\(raw: convenienceModifier)init(\(raw: parametersStr))\(raw: throwsStr)
+      """
+  }
+
+  private func typeReferencesTypeParam(_ type: Type?, _ typeParam: TypeVariable<Method>) -> Bool {
+    guard let type else { return false }
+    if type.isEqualTo(typeParam.as(Type.self)) {
+      return true
+    }
+    if let wildcard = type.as(WildcardType.self) {
+      return wildcard.getUpperBounds().contains { $0.map { typeParam.as(Type.self).isEqualTo($0) } ?? false }
+        || wildcard.getLowerBounds().contains { $0.map { typeParam.as(Type.self).isEqualTo($0) } ?? false }
+    }
+    return false
+  }
+
+  func genericParameterIsUsedInSignature(_ typeParam: TypeVariable<Method>, in method: Method) -> Bool {
+    // --- Return type
+    // Is the return type exactly the type param
+    // FIXME: make this equals based?
+    if method.getGenericReturnType().getTypeName() == typeParam.getTypeName() {
+      return true
+    }
+
+    if let parameterizedReturnType = method.getGenericReturnType().as(ParameterizedType.self) {
+      for actualTypeParam in parameterizedReturnType.getActualTypeArguments() {
+        if typeReferencesTypeParam(actualTypeParam, typeParam) {
+          return true
+        }
+      }
+    }
+
+    if let genericArrayType = method.getGenericReturnType().as(GenericArrayType.self) {
+      if genericArrayType.getGenericComponentType().isEqualTo(typeParam.as(Type.self)) {
+        return true
+      }
+    }
+
+    // --- Parameter types
+    for parameter in method.getParameters() {
+      if let parameterizedType = parameter?.getParameterizedType() {
+        if parameterizedType.isEqualTo(typeParam.as(Type.self)) {
+          return true
+        }
+
+        // Also check if the type param is used as a type argument inside a parameterized parameter type
+        if let parameterizedParamType = parameterizedType.as(ParameterizedType.self) {
+          for actualTypeParam in parameterizedParamType.getActualTypeArguments() {
+            if typeReferencesTypeParam(actualTypeParam, typeParam) {
+              return true
+            }
+          }
+        }
+
+        if let genericArrayType = parameterizedType.as(GenericArrayType.self) {
+          if genericArrayType.getGenericComponentType().isEqualTo(typeParam.as(Type.self)) {
+            return true
+          }
+        }
+      }
+    }
+
+    return false
+  }
+
+  // TODO: make it more precise with the "origin" of the generic parameter (outer class etc)
+  func collectMethodGenericParameters(
+    genericParameters: [String],
+    method: Method
+  ) -> OrderedSet<String> {
+    var allGenericParameters = OrderedSet(genericParameters)
+
+    let typeParameters = method.getTypeParameters() as [TypeVariable<JavaLangReflect.Method>?]
+    for typeParameter in typeParameters {
+      guard let typeParameter else { continue }
+
+      guard genericParameterIsUsedInSignature(typeParameter, in: method) else {
+        continue
+      }
+
+      allGenericParameters.append("\(typeParameter.getTypeName()): AnyJavaObject")
+    }
+
+    return allGenericParameters
+  }
+
+  /// Translates the given Java method into a Swift declaration.
+  package func renderMethod(
+    _ javaMethod: Method,
+    implementedInSwift: Bool,
+    genericParameters: [String] = [],
+    whereClause: String = "",
+    asCrossModuleExtensionMember: Bool = false
+  ) throws -> DeclSyntax {
+    // Map the generic params on the method.
+    let allGenericParameters = collectMethodGenericParameters(genericParameters: genericParameters, method: javaMethod)
+    let genericParameterClauseStr =
+      if allGenericParameters.isEmpty {
+        ""
+      } else {
+        "<\(allGenericParameters.joined(separator: ", "))>"
+      }
+
+    // Map the parameters.
+    let parameters = try translateJavaParameters(javaMethod)
+    let parametersStr = parameters.map { $0.description }.joined(separator: ", ")
+
+    // Map the result type.
+    let resultTypeStr: String
+    let resultType = try translator.getSwiftReturnTypeNameAsString(
+      method: javaMethod,
+      substitution: substitution,
+      preferValueTypes: true,
+      outerOptional: .implicitlyUnwrappedOptional
+    )
+    let hasTypeEraseGenericResultType: Bool =
+      isTypeErased(javaMethod.getGenericReturnType())
+
+    // FIXME: cleanup the checking here
+    if resultType != "Void" && resultType != "Swift.Void" {
+      resultTypeStr = " -> \(resultType)"
+    } else {
+      resultTypeStr = ""
+    }
+
+    // --- Handle other effects
+    let throwsStr = javaMethod.throwsCheckedException ? "throws" : ""
+    let (swiftMethodName, swiftMethodNameEscaped) = javaMethod.getName().escapedSwiftName
+    let (swiftOptionalMethodName, _) = "\(javaMethod.getName())Optional".escapedSwiftName
+
+    // --- Handle docs for the generated method.
+    // Include the original Java signature
+    let docsString =
+      """
+        /// Java method `\(javaMethod.getName())`.
+        ///
+        /// ### Java method signature
+        /// ```java
+        /// \(javaMethod.toGenericString())
+        /// ```
+      """
+
+    // --- Handle @available attributes from Java annotations (e.g. @Deprecated, @RequiresApi)
+    let methodAnnotations = javaMethod.getDeclaredAnnotations().compactMap(\.self)
+    let invisibleMethodAnnotations = runtimeInvisibleAnnotations.annotationsFor(method: javaMethod)
+    let availableAttributes = swiftAvailableAttributes(
+      from: methodAnnotations,
+      runtimeInvisibleAnnotations: invisibleMethodAnnotations,
+      javaClass: javaClass,
+      javaMethod: javaMethod
+    )
+
+    // Compute the parameters for '@...JavaMethod(...)'
+    let methodAttribute: AttributeSyntax
+    if implementedInSwift {
+      methodAttribute = ""
+    } else {
+      var methodAttributeStr =
+        if javaMethod.isStatic {
+          "@JavaStaticMethod"
+        } else {
+          "@JavaMethod"
+        }
+      // Do we need to record any generic information, in order to enable type-erasure for the upcalls?
+      var parameters: [String] = []
+      if swiftMethodNameEscaped {
+        parameters.append("\"\(javaMethod.getName())\"")
+      }
+      if hasTypeEraseGenericResultType {
+        let returnType = javaMethod.getReturnType()!
+        parameters.append(#"typeErasedResult: "\#(resultType)""#)
+        if returnType.getName() != "java.lang.Object" {
+          var boundType = try translator.getSwiftTypeNameAsString(
+            method: javaMethod,
+            returnType.as(Type.self),
+            substitution: substitution,
+            preferValueTypes: true,
+            outerOptional: .nonoptional
+          )
+          // `getSwiftTypeNameAsString` does not include generic parameters for non parameterized type
+          if let returnClass = returnType.as(JavaClass<JavaObject>.self) {
+            let typeParameters = returnClass.getTypeParameters()
+            if !typeParameters.isEmpty {
+              boundType += "<\([String](repeating: "JavaObject", count: typeParameters.count).joined(separator: ", "))>"
+            }
+          }
+          parameters.append(#"typeErasedResultBound: \#(boundType)?.self"#)
+        }
+      }
+
+      if !parameters.isEmpty {
+        methodAttributeStr += "("
+        methodAttributeStr.append(parameters.joined(separator: ", "))
+        methodAttributeStr += ")"
+      }
+      methodAttributeStr += "\n"
+      methodAttribute = "\(raw: methodAttributeStr)"
+    }
+
+    let accessModifier =
+      implementedInSwift
+      ? ""
+      : (asCrossModuleExtensionMember || javaMethod.isStatic || !translateAsClass)
+        ? "public "
+        : "open "
+    let overrideOpt =
+      (!asCrossModuleExtensionMember && translateAsClass && !javaMethod.isStatic && isOverride(javaMethod))
+      ? "override "
+      : ""
+
+    // FIXME: refactor this so we don't have to duplicate the method signatures
+    if resultType.optionalWrappedType() != nil
+      || parameters.contains(where: { $0.type.trimmedDescription.optionalWrappedType() != nil })
+    {
+      let parameters = parameters.map { param -> (clause: FunctionParameterSyntax, passedArg: String) in
+        let name = param.secondName!.trimmedDescription
+
+        return if let optionalType = param.type.trimmedDescription.optionalWrappedType() {
+          (clause: "_ \(raw: name): \(raw: optionalType)", passedArg: "\(name).toJavaOptional()")
+        } else {
+          (clause: param, passedArg: "\(name)")
+        }
+      }
+
+      let resultOptional: String = resultType.optionalWrappedType() ?? resultType
+      let baseBody: ExprSyntax =
+        "\(raw: javaMethod.throwsCheckedException ? "try " : "")\(raw: swiftMethodName)(\(raw: parameters.map(\.passedArg).joined(separator: ", ")))"
+      let body: ExprSyntax =
+        if resultType.optionalWrappedType() != nil {
+          "Optional(javaOptional: \(baseBody))"
+        } else {
+          baseBody
+        }
+
+      return
+        """
+        \(raw: docsString)
+        \(raw: availableAttributes.render())\(methodAttribute)\(raw: accessModifier)\(raw: overrideOpt)func \(raw: swiftMethodName)\(raw: genericParameterClauseStr)(\(raw: parametersStr))\(raw: throwsStr)\(raw: resultTypeStr)\(raw: whereClause)
+
+        \(raw: accessModifier)\(raw: overrideOpt)func \(raw: swiftOptionalMethodName)\(raw: genericParameterClauseStr)(\(raw: parameters.map(\.clause.description).joined(separator: ", ")))\(raw: throwsStr) -> \(raw: resultOptional)\(raw: whereClause) {
+          \(body)
+        }
+        """
+    } else {
+      return
+        """
+        \(raw: docsString)
+        \(raw: availableAttributes.render())\(methodAttribute)\(raw: accessModifier)\(raw: overrideOpt)func \(raw: swiftMethodName)\(raw: genericParameterClauseStr)(\(raw: parametersStr))\(raw: throwsStr)\(raw: resultTypeStr)\(raw: whereClause)
+        """
+    }
+  }
+
+  /// Render a single Java field into the corresponding Swift property, or
+  /// throw an error if that is not possible for any reason.
+  package func renderField(_ javaField: Field) throws -> DeclSyntax {
+    let typeName = try translator.getSwiftTypeNameAsString(
+      javaField.getGenericType()!,
+      substitution: substitution,
+      preferValueTypes: true,
+      outerOptional: .implicitlyUnwrappedOptional
+    )
+    let (swiftFieldName, swiftFieldNameIsEscaped) = javaField.getName().escapedSwiftName
+    var fieldAttributeStr =
+      if javaField.isStatic {
+        "@JavaStaticField"
+      } else {
+        "@JavaField"
+      }
+    var parameters: [String] = []
+    if swiftFieldNameIsEscaped {
+      parameters.append("\"\(javaField.getName())\"")
+    }
+    parameters.append("isFinal: \(javaField.isFinal)")
+    if !parameters.isEmpty {
+      fieldAttributeStr += "("
+      fieldAttributeStr.append(parameters.joined(separator: ", "))
+      fieldAttributeStr += ")"
+    }
+    let fieldAttribute: AttributeSyntax = "\(raw: fieldAttributeStr)"
+    let fieldAnnotations = javaField.getDeclaredAnnotations().compactMap(\.self)
+    let invisibleFieldAnnotations = runtimeInvisibleAnnotations.annotationsFor(field: javaField.getName())
+    let availableAttributes = swiftAvailableAttributes(
+      from: fieldAnnotations,
+      runtimeInvisibleAnnotations: invisibleFieldAnnotations,
+      javaClass: javaClass,
+      javaFieldName: javaField.getName()
+    )
+
+    if let optionalType = typeName.optionalWrappedType() {
+      let setter =
+        if !javaField.isFinal {
+          """
+
+            set {
+              \(swiftFieldName) = newValue.toJavaOptional()
+            }
+          """
+        } else {
+          ""
+        }
+      return """
+        \(raw: availableAttributes.render())\(fieldAttribute)
+        public var \(raw: swiftFieldName): \(raw: typeName)
+
+
+        public var \(raw: swiftFieldName)Optional: \(raw: optionalType) {
+          get {
+            Optional(javaOptional: \(raw: swiftFieldName))
+          }\(raw: setter)
+        }
+        """
+    } else {
+      return """
+        \(raw: availableAttributes.render())\(fieldAttribute)
+        public var \(raw: swiftFieldName): \(raw: typeName)
+        """
+    }
+  }
+
+  package func renderEnum(name: String) -> [DeclSyntax] {
+    if enumConstants.isEmpty {
+      return []
+    }
+
+    let extensionSyntax: DeclSyntax = """
+        public enum \(raw: name): Equatable {
+          \(raw: enumConstants.map { "case \($0.getName())" }.joined(separator: "\n"))
+        }
+      """
+
+    let mappingSyntax: DeclSyntax = """
+        public var enumValue: \(raw: name)! {
+          let classObj = self.javaClass
+          \(raw: enumConstants.map {
+          // The equals method takes a java object, so we need to cast it here
+          """
+          if self.equals(classObj.\($0.getName())?.as(JavaObject.self)) {
+                return \(name).\($0.getName())
+          }
+          """
+        }.joined(separator: " else ")) else {
+            return nil
+          }
+        }
+      """
+
+    let convenienceModifier = translateAsClass ? "convenience " : ""
+    let initSyntax: DeclSyntax = """
+      public \(raw: convenienceModifier)init(_ enumValue: \(raw: name), environment: JNIEnvironment? = nil) {
+        let _environment = if let environment {
+          environment
+        } else {
+          try! JavaVirtualMachine.shared().environment()
+        }
+        let classObj = try! JavaClass<\(raw: swiftInnermostTypeName)>(environment: _environment)
+        switch enumValue {
+      \(raw: enumConstants.map {
+      """
+          case .\($0.getName()):
+            if let \($0.getName()) = classObj.\($0.getName()) {
+              \(translateAsClass
+                  ? "self.init(javaHolder: \($0.getName()).javaHolder)"
+                  : "self = \($0.getName())")
+            } else {
+              fatalError("Enum value \($0.getName()) was unexpectedly nil, please re-run swift-java on the most updated Java class")
+            }
+      """
+      }.joined(separator: "\n"))
+        }
+      }
+      """
+
+    return [extensionSyntax, mappingSyntax, initSyntax]
+  }
+
+  // Translate a Java parameter list into Swift parameters.
+  private func translateJavaParameters(
+    _ javaMethod: JavaLangReflect.Method
+  ) throws -> [FunctionParameterSyntax] {
+    let parameters: [Parameter?] = javaMethod.getParameters()
+
+    return try parameters.compactMap { javaParameter in
+      guard let javaParameter else { return nil }
+
+      let typeName = try translator.getSwiftTypeNameAsString(
+        method: javaMethod,
+        javaParameter.getParameterizedType()!,
+        substitution: substitution,
+        preferValueTypes: true,
+        outerOptional: .optional
+      )
+      let paramName = javaParameter.getName()
+      return "_ \(raw: paramName): \(raw: typeName)"
+    }
+  }
+
+  // Translate a Java parameter list into Swift parameters.
+  @available(*, deprecated, message: "Prefer the method based version") // FIXME: constructors are not well handled
+  private func translateJavaParameters(
+    _ parameters: [Parameter?]
+  ) throws -> [FunctionParameterSyntax] {
+    try parameters.compactMap { javaParameter in
+      guard let javaParameter else { return nil }
+
+      let typeName = try translator.getSwiftTypeNameAsString(
+        javaParameter.getParameterizedType()!,
+        substitution: substitution,
+        preferValueTypes: true,
+        outerOptional: .optional
+      )
+      let paramName = javaParameter.getName()
+      return "_ \(raw: paramName): \(raw: typeName)"
+    }
+  }
+}
+
+/// Helper struct that collects methods, removing any that have been overridden
+/// by a covariant method.
+struct MethodCollector {
+  var methods: [Method] = []
+
+  /// Mapping from method names to the indices of each method within the
+  /// list of methods.
+  var methodsByName: [String: [Int]] = [:]
+
+  /// Add this method to the collector.
+  mutating func add(_ method: Method) {
+    // Compare against existing methods with this same name.
+    for existingMethodIndex in methodsByName[method.getName()] ?? [] {
+      let existingMethod = methods[existingMethodIndex]
+      switch MethodVariance(method, existingMethod) {
+      case .equivalent, .unrelated:
+        // Nothing to do.
+        continue
+
+      case .contravariantResult:
+        // This method is worse than what we have; there is nothing to do.
+        return
+
+      case .covariantResult:
+        // This method is better than the one we have; replace the one we
+        // have with it.
+        methods[existingMethodIndex] = method
+        return
+      }
+    }
+
+    // If we get here, there is no related method in the list. Add this
+    // new method.
+    methodsByName[method.getName(), default: []].append(methods.count)
+    methods.append(method)
+  }
+}
+
+// MARK: Utility functions
+
+extension JavaClassTranslator {
+  /// Determine whether this method is an override of another Java
+  /// method.
+  func isOverride(_ method: Method) -> Bool {
+    var currentSuperclass = effectiveJavaSuperclass
+    while let currentSuperclassNonOpt = currentSuperclass {
+      // Set the loop up for the next run.
+      defer {
+        currentSuperclass = currentSuperclassNonOpt.getSuperclass()
+      }
+
+      do {
+        // If this class didn't get translated into Swift, skip it.
+        if translator.translatedClasses[currentSuperclassNonOpt.getName()] == nil {
+          continue
+        }
+
+        // If this superclass declares a method with the same parameter types,
+        // we have an override.
+        guard
+          let overriddenMethod =
+            try currentSuperclassNonOpt
+            .getDeclaredMethod(method.getName(), method.getParameterTypes())
+        else {
+          continue
+        }
+
+        guard shouldExtract(method: overriddenMethod, config: translator.config) else {
+          continue
+        }
+
+        // We know that Java considers this method an override. However, it is
+        // possible that Swift will not consider it an override, because Java
+        // has subtyping relations that Swift does not.
+        if method.getGenericReturnType().isEqualToOrSubtypeOf(overriddenMethod.getGenericReturnType()) {
+          return true
+        }
+      } catch {
+        log.debug("Failed to determine if method '\(method)' is an override, error: \(error)")
+      }
+    }
+
+    return false
+  }
+}
+
+extension [Type?] {
+  /// Determine whether the types in the array match the other array.
+  func allTypesEqual(_ other: [Type?]) -> Bool {
+    if self.count != other.count {
+      return false
+    }
+
+    for (selfType, otherType) in zip(self, other) {
+      if !selfType!.isEqualTo(otherType!) {
+        return false
+      }
+    }
+
+    return true
+  }
+}

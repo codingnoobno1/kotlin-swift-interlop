@@ -1,0 +1,840 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2024-2025 Apple Inc. and the Swift.org project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift.org project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+import CodePrinting
+import SwiftExtract
+import SwiftJavaConfigurationShared
+import SwiftJavaJNICore
+
+extension FFMSwift2JavaGenerator {
+  package func printFunctionDowncallMethods(
+    _ printer: inout JavaPrinter,
+    _ decl: ExtractedFunc,
+  ) {
+    guard let _ = translatedDecl(for: decl) else {
+      // Failed to translate. Skip.
+      return
+    }
+
+    printer.printSeparator(decl.displayName)
+
+    printJavaBindingDescriptorClass(&printer, decl)
+
+    printJavaBindingWrapperHelperClass(&printer, decl)
+
+    // Render the "make the downcall" functions.
+    printJavaBindingWrapperMethod(&printer, decl)
+  }
+
+  /// Print FFM Java binding descriptors for the imported Swift API.
+  package func printJavaBindingDescriptorClass(
+    _ printer: inout JavaPrinter,
+    _ decl: ExtractedFunc,
+  ) {
+    let thunkName = thunkNameRegistry.functionThunkName(decl: decl)
+    let translated = self.translatedDecl(for: decl)!
+    // 'try!' because we know 'loweredSignature' can be described with C.
+    let cFunc = try! translated.loweredSignature.cFunctionDecl(cName: thunkName)
+
+    printJavaBindingDescriptorClass(&printer, cFunc, symbolLookup: currentSymbolLookup) { printer in
+      if let outCallback = translated.translatedSignature.result.outCallback {
+        self.printUpcallParameterDescriptorClasses(&printer, outCallback)
+      } else { // FIXME: not an "else"
+        self.printParameterDescriptorClasses(&printer, cFunc)
+      }
+    }
+  }
+
+  /// Reusable function to print the FFM Java binding descriptors for a C function.
+  package func printJavaBindingDescriptorClass(
+    _ printer: inout JavaPrinter,
+    _ cFunc: CFunction,
+    symbolLookup: SymbolLookupTarget = .module,
+    additionalContent: ((inout JavaPrinter) -> Void)? = nil,
+  ) {
+    let lookup = symbolLookup.javaClassName(moduleName: self.swiftModuleName)
+    printer.printBraceBlock(
+      """
+      /**
+       * \(config.javadocCodeSnippetStart(lang: "c"))
+       * \(cFunc.description)
+       * \(config.javadocCodeSnippetEnd)
+       */
+      private static class \(cFunc.name)
+      """
+    ) { printer in
+      printFunctionDescriptorDefinition(&printer, cFunc.resultType, cFunc.parameters)
+      printer.print(
+        """
+        private static final MemorySegment ADDR =
+          \(lookup).findOrThrow("\(cFunc.name)");
+        private static final MethodHandle HANDLE = Linker.nativeLinker().downcallHandle(ADDR, DESC);
+        """
+      )
+      printJavaBindingDowncallMethod(&printer, cFunc)
+      additionalContent?(&printer)
+    }
+  }
+
+  /// Print the 'FunctionDescriptor' of the lowered cdecl thunk.
+  func printFunctionDescriptorDefinition(
+    _ printer: inout JavaPrinter,
+    _ resultType: CType,
+    _ parameters: [CParameter],
+  ) {
+    printer.start("private static final FunctionDescriptor DESC = ")
+
+    let isEmptyParam = parameters.isEmpty
+    if resultType.isVoid {
+      printer.print("FunctionDescriptor.ofVoid(", isEmptyParam ? .continue : .newLine)
+      printer.indent()
+    } else {
+      printer.print("FunctionDescriptor.of(")
+      printer.indent()
+      printer.print("/* -> */", .continue)
+      printer.print(resultType.foreignValueLayout, .parameterNewlineSeparator(isEmptyParam))
+    }
+
+    for (param, isLast) in parameters.withIsLast {
+      printer.print("/* \(param.name ?? "_"): */", .continue)
+      printer.print(param.type.foreignValueLayout, .parameterNewlineSeparator(isLast))
+    }
+
+    printer.outdent()
+    printer.print(");")
+  }
+
+  func printJavaBindingDowncallMethod(
+    _ printer: inout JavaPrinter,
+    _ cFunc: CFunction,
+  ) {
+    let returnTy = cFunc.resultType.javaType
+    let maybeReturn = cFunc.resultType.isVoid ? "" : "return (\(returnTy)) "
+
+    var params: [String] = []
+    var args: [String] = []
+    for param in cFunc.parameters {
+      let name = param.name! // !-safe, because cdecl lowering guarantees the parameter named.
+
+      let annotationsStr =
+        if param.type.javaType.parameterAnnotations.isEmpty {
+          ""
+        } else {
+          param.type.javaType.parameterAnnotations.map({ $0.render() }).joined(separator: " ") + " "
+        }
+      params.append("\(annotationsStr)\(param.type.javaType) \(name)")
+      args.append(name)
+    }
+    let paramsStr = params.joined(separator: .comma)
+    let argsStr = args.joined(separator: .comma)
+
+    printer.print(
+      """
+      public static \(returnTy) call(\(paramsStr)) {
+        try {
+          if (CallTraces.TRACE_DOWNCALLS) {
+            CallTraces.traceDowncall(\(argsStr));
+          }
+          \(maybeReturn)HANDLE.invokeExact(\(argsStr));
+        } catch (Throwable ex$) {
+          throw new AssertionError("should not reach here", ex$);
+        }
+      }
+      """
+    )
+  }
+
+  /// Print required helper classes/interfaces for describing the CFunction.
+  ///
+  /// * function pointer parameter as a functional interface.
+  /// * Unnamed-struct parameter as a record. (unimplemented)
+  func printParameterDescriptorClasses(
+    _ printer: inout JavaPrinter,
+    _ cFunc: CFunction,
+  ) {
+    for param in cFunc.parameters {
+      switch param.type {
+      case .pointer(.function):
+        let name = "$\(param.name!)"
+        printFunctionPointerParameterDescriptorClass(&printer, name, param.type, impl: nil)
+      default:
+        continue
+      }
+    }
+  }
+
+  func printUpcallParameterDescriptorClasses(
+    _ printer: inout JavaPrinter,
+    _ outCallback: OutCallback,
+  ) {
+    let name = outCallback.name
+    printFunctionPointerParameterDescriptorClass(&printer, name, outCallback.cFunc.functionType, impl: outCallback)
+  }
+
+  /// Print a class describing a function pointer parameter type.
+  ///
+  ///   ```java
+  ///   class $<parameter-name> {
+  ///     @FunctionalInterface
+  ///     interface Function {
+  ///       <return-type> apply(<parameters>);
+  ///     }
+  ///     static final MethodDescriptor DESC = FunctionDescriptor.of(...);
+  ///     static final MethodHandle HANDLE = SwiftRuntime.upcallHandle(Function.class, "apply", DESC);
+  ///     static MemorySegment toUpcallStub(Function fi, Arena arena) {
+  ///       return Linker.nativeLinker().upcallStub(HANDLE.bindTo(fi), DESC, arena);
+  ///     }
+  ///   }
+  ///   ```
+  ///
+  /// If a `functionBody` is provided, a `Function$Impl` class will be emitted as well.
+  func printFunctionPointerParameterDescriptorClass(
+    _ printer: inout JavaPrinter,
+    _ name: String,
+    _ cType: CType,
+    impl: OutCallback?,
+  ) {
+    let cResultType: CType
+    let cParameterTypes: [CType]
+    if case .pointer(.function(let _cResultType, let _cParameterTypes, variadic: false)) = cType {
+      cResultType = _cResultType
+      cParameterTypes = _cParameterTypes
+    } else if case .function(let _cResultType, let _cParameterTypes, variadic: false) = cType {
+      cResultType = _cResultType
+      cParameterTypes = _cParameterTypes
+    } else {
+      fatalError("must be a C function (pointer) type; name=\(name), cType=\(cType)")
+    }
+
+    let cParams = cParameterTypes.enumerated().map { i, ty in
+      CParameter(name: "_\(i)", type: ty)
+    }
+    let paramDecls = cParams.map({ "\($0.type.javaType) \($0.name!)" })
+
+    printer.printBraceBlock(
+      """
+      /**
+       * {snippet lang=c :
+       * \(cType)
+       * }
+       */
+      private static class \(name)
+      """
+    ) { printer in
+      let (interfaceName, methodName, isKnownFuncInterface) =
+        if let known = KnownJavaFunctionalInterface.find(parameters: cParameterTypes, result: cResultType) {
+          (known.javaType.description, known.method, true)
+        } else {
+          ("Function", "apply", false)
+        }
+
+      if !isKnownFuncInterface {
+        printer.print(
+          """
+          @FunctionalInterface
+          public interface Function {
+            \(cResultType.javaType) apply(\(paramDecls.joined(separator: .comma)));
+          }
+          """
+        )
+
+        if let impl {
+          printer.print(
+            """
+            public final static class Function$Impl implements Function {
+              \(impl.members.joinedJavaStatements(indent: 2))
+              public \(cResultType.javaType) apply(\(paramDecls.joined(separator: .comma))) {
+                \(impl.body)
+              }
+            }
+            """
+          )
+        }
+      }
+
+      printFunctionDescriptorDefinition(&printer, cResultType, cParams)
+      printer.print(
+        """
+        private static final MethodHandle HANDLE = SwiftRuntime.upcallHandle(\(interfaceName).class, "\(methodName)", DESC);
+        private static MemorySegment toUpcallStub(\(interfaceName) fi, Arena arena) {
+          return Linker.nativeLinker().upcallStub(HANDLE.bindTo(fi), DESC, arena);
+        }
+        """
+      )
+    }
+  }
+
+  /// Print the helper type container for a user-facing Java API.
+  func printJavaBindingWrapperHelperClass(
+    _ printer: inout JavaPrinter,
+    _ decl: ExtractedFunc,
+  ) {
+    let translated = self.translatedDecl(for: decl)!
+    let bindingDescriptorName = self.thunkNameRegistry.functionThunkName(decl: decl)
+    if translated.functionTypes.isEmpty {
+      return
+    }
+
+    printer.printBraceBlock(
+      """
+      public static class \(translated.name)
+      """
+    ) { printer in
+      for functionType in translated.functionTypes {
+        printJavaBindingWrapperFunctionTypeHelper(&printer, functionType, bindingDescriptorName)
+      }
+    }
+  }
+
+  /// Print "wrapper" functional interface representing a Swift closure type.
+  func printJavaBindingWrapperFunctionTypeHelper(
+    _ printer: inout JavaPrinter,
+    _ functionType: TranslatedFunctionType,
+    _ bindingDescriptorName: String,
+  ) {
+    let cdeclDescriptor = "\(bindingDescriptorName).$\(functionType.name)"
+    if functionType.isCompatibleWithC {
+      let (interfaceName, isKnownFuncInterface) =
+        if let known = KnownJavaFunctionalInterface.find(functionType) {
+          (known.javaType.description, true)
+        } else {
+          (functionType.name, false)
+        }
+
+      if !isKnownFuncInterface {
+        // If the user-facing functional interface is C ABI compatible, just extend
+        // the lowered function pointer parameter interface.
+        printer.print(
+          """
+          @FunctionalInterface
+          public interface \(interfaceName) extends \(cdeclDescriptor).Function {}
+          """
+        )
+      }
+
+      printer.print(
+        """
+        private static MemorySegment $toUpcallStub(\(interfaceName) fi, Arena arena) {
+          return \(bindingDescriptorName).$\(functionType.name).toUpcallStub(fi, arena);
+        }
+        """
+      )
+    } else {
+      // Otherwise, the lambda must be wrapped with the lowered function instance.
+      let apiParams = functionType.parameters.map {
+        "\($0.parameter.type) \($0.parameter.name)"
+      }
+
+      printer.print(
+        """
+        @FunctionalInterface
+        public interface \(functionType.name) {
+          \(functionType.result.javaResultType) apply(\(apiParams.joined(separator: .comma)));
+        }
+        """
+      )
+
+      let cdeclParams = functionType.cdeclType.parameters.map({ "\($0.parameterName!)" })
+
+      printer.printBraceBlock(
+        """
+        private static MemorySegment $toUpcallStub(\(functionType.name) fi, Arena arena)
+        """
+      ) { printer in
+        printer.print(
+          """
+          return \(cdeclDescriptor).toUpcallStub((\(cdeclParams.joined(separator: .comma))) -> {
+          """
+        )
+        printer.indent()
+        var convertedArgs: [String] = []
+        for param in functionType.parameters {
+          let arg = param.conversion.render(&printer, param.parameter.name)
+          convertedArgs.append(arg)
+        }
+
+        let call = "fi.apply(\(convertedArgs.joined(separator: .comma)))"
+        let result = functionType.result.conversion.render(&printer, call)
+        if functionType.result.javaResultType == .void {
+          printer.print("\(result);")
+        } else {
+          printer.print("return \(result);")
+        }
+        printer.outdent()
+        printer.print("}, arena);")
+      }
+    }
+  }
+
+  /// Print the calling body that forwards all the parameters to the `methodName`,
+  /// with adding `SwiftArena.ofAuto()` at the end.
+  package func printJavaBindingWrapperMethod(
+    _ printer: inout JavaPrinter,
+    _ decl: ExtractedFunc,
+  ) {
+    let translated = self.translatedDecl(for: decl)!
+    let methodName = translated.name
+
+    var modifiers = "public"
+    switch decl.functionSignature.selfParameter {
+    case .staticMethod, .classMethod, .initializer, nil:
+      modifiers.append(" static")
+    default:
+      break
+    }
+
+    let translatedSignature = translated.translatedSignature
+    let returnTy = translatedSignature.result.javaResultType
+
+    var annotationsStr = translatedSignature.annotations.map({ $0.render() }).joined(separator: "\n")
+    if !annotationsStr.isEmpty { annotationsStr += "\n" }
+
+    var paramDecls = translatedSignature.parameters
+      .map { $0.parameter.renderParameter() }
+    if translatedSignature.requiresSwiftArena {
+      paramDecls.append("AllocatingSwiftArena swiftArena")
+    }
+
+    var throwsClauses: [String] = []
+    // If a Swift function is 'throws' we throw a checked error for the Java side
+    // TODO: When we support typed throws on Swift side we'll want to throw the right type here instead
+    if translatedSignature.isThrowing {
+      throwsClauses.append(JavaType.swiftJavaErrorException.className!)
+    }
+    if translatedSignature.canThrowSwiftIntegerOverflowException {
+      throwsClauses.append(JavaType.swiftIntegerOverflowException.className!)
+    }
+    let throwsClause = throwsClauses.isEmpty ? "" : " throws \(throwsClauses.joined(separator: .comma))"
+
+    TranslatedDocumentation.printDocumentation(
+      importedFunc: decl,
+      translatedDecl: translated,
+      config: config,
+      in: &printer,
+    )
+    printer.printBraceBlock(
+      """
+      \(annotationsStr)\(modifiers) \(returnTy) \(methodName)(\(paramDecls.joined(separator: .comma)))\(throwsClause)
+      """
+    ) { printer in
+      if case .instance = decl.functionSignature.selfParameter {
+        // Make sure the object has not been destroyed.
+        printer.print("$ensureAlive();")
+      }
+
+      printDowncall(&printer, decl)
+    }
+  }
+
+  /// Print the actual downcall to the Swift API.
+  ///
+  /// This assumes that all the parameters are passed-in with appropriate names.
+  package func printDowncall(
+    _ printer: inout JavaPrinter,
+    _ decl: ExtractedFunc,
+  ) {
+    //===  Part 1: prepare temporary arena if needed.
+    let translatedSignature = self.translatedDecl(for: decl)!.translatedSignature
+
+    if translatedSignature.requiresTemporaryArena {
+      printer.print("try(var arena$ = Arena.ofConfined()) {")
+      printer.indent()
+    }
+
+    //===  Part 2: prepare all arguments.
+    var downCallArguments: [String] = []
+
+    // Regular parameters.
+    for parameter in translatedSignature.parameters {
+      let lowered = parameter.conversion.render(&printer, parameter.parameter.name)
+      downCallArguments.append(lowered)
+    }
+
+    // 'self' parameter.
+    if let selfParameter = translatedSignature.selfParameter {
+      let lowered = selfParameter.conversion.render(&printer, "this")
+      downCallArguments.append(lowered)
+    }
+
+    // Indirect return receivers.
+    for outParameter in translatedSignature.result.outParameters {
+      guard case .concrete(let type) = outParameter.type else {
+        continue
+      }
+      let memoryLayout = renderMemoryLayoutValue(for: type)
+
+      let arena =
+        if let className = type.className,
+          analysis.extractedTypes[className] != nil
+        {
+          // Use passed-in 'SwiftArena' for 'SwiftValue'.
+          "swiftArena"
+        } else {
+          // Otherwise use the temporary 'Arena'.
+          "arena$"
+        }
+
+      // FIXME: use trailing$ convention
+      let varName = outParameter.name.isEmpty ? "result$" : "result$_" + outParameter.name
+
+      printer.print(
+        "MemorySegment \(varName) = \(arena).allocate(\(memoryLayout));"
+      )
+      downCallArguments.append(varName)
+    }
+
+    let thunkName = thunkNameRegistry.functionThunkName(decl: decl)
+
+    if let outCallback = translatedSignature.result.outCallback {
+      let varName = outCallback.name
+      downCallArguments.append(
+        """
+        \(thunkName).\(outCallback.name).toUpcallStub(\(varName), arena$)
+        """
+      )
+    }
+
+    // Error out parameter for throwing functions.
+    if translatedSignature.isThrowing {
+      printer.print("MemorySegment result$throws = arena$.allocate(ValueLayout.ADDRESS);")
+      printer.print("result$throws.set(ValueLayout.ADDRESS, 0, MemorySegment.NULL);")
+      downCallArguments.append("result$throws")
+    }
+
+    let hasOverflowChecks = translatedSignature.parameters.contains { $0.needs32BitIntOverflowCheck != .none }
+    if hasOverflowChecks {
+      printer.printIfBlock("SwiftValueLayout.has32bitSwiftInt") { printer in
+        for (i, parameter) in translatedSignature.parameters.enumerated() {
+          switch parameter.needs32BitIntOverflowCheck {
+          case .none:
+            break
+          case .signedInt:
+            let original = decl.functionSignature.parameters[i]
+            let parameterName = original.parameterName ?? "_\(i)"
+            printer.printIfBlock("\(parameterName) < Integer.MIN_VALUE || \(parameterName) > Integer.MAX_VALUE") { printer in
+              printer.print("throw new SwiftIntegerOverflowException(\"Parameter '\(parameterName)' overflow: \" + \(parameterName));")
+            }
+          case .unsignedInt:
+            let original = decl.functionSignature.parameters[i]
+            let parameterName = original.parameterName ?? "_\(i)"
+            printer.printIfBlock("\(parameterName) < 0 || \(parameterName) > 0xFFFFFFFFL") { printer in
+              printer.print("throw new SwiftIntegerOverflowException(\"Parameter '\(parameterName)' overflow: \" + \(parameterName));")
+            }
+          }
+        }
+      }
+    }
+
+    //=== Part 3: Downcall.
+    let downCall = "\(thunkName).call(\(downCallArguments.joined(separator: .comma)))"
+
+    /// Helper to emit the error check after a downcall
+    func printErrorCheck(_ printer: inout JavaPrinter) {
+      guard translatedSignature.isThrowing else { return }
+      printer.printIfBlock("!result$throws.get(ValueLayout.ADDRESS, 0).equals(MemorySegment.NULL)") { printer in
+        printer.print("throw new \(JavaType.swiftJavaErrorException.className!)(result$throws.get(ValueLayout.ADDRESS, 0), AllocatingSwiftArena.ofAuto());")
+      }
+    }
+
+    //=== Part 4: Convert the return value.
+    if translatedSignature.result.javaResultType == .void {
+      // Trivial downcall with no conversion needed, no callback either
+      printer.print("\(downCall);")
+      printErrorCheck(&printer)
+    } else {
+      let placeholder: String
+      let placeholderForDowncall: String?
+
+      if let outCallback = translatedSignature.result.outCallback {
+        placeholder = "\(outCallback.name)" // the result will be read out from the result$initialize java class
+        placeholderForDowncall = "\(downCall)"
+      } else if translatedSignature.result.outParameters.isEmpty {
+        if translatedSignature.isThrowing {
+          // When throwing, we must separate the downcall from result conversion
+          // so we can check the error pointer between them.
+          let cResultType = self.translatedDecl(for: decl)!.loweredSignature.result.cdeclResultType
+          let javaResultType = (try? CType(cdeclType: cResultType))?.javaType ?? .javaForeignMemorySegment
+          printer.print("var result$ = (\(javaResultType)) \(downCall);")
+          printErrorCheck(&printer)
+          placeholder = "result$"
+        } else {
+          placeholder = downCall
+        }
+        placeholderForDowncall = nil
+      } else {
+        // FIXME: Support cdecl thunk returning a value while populating the out parameters.
+        printer.print("\(downCall);")
+        printErrorCheck(&printer)
+        placeholderForDowncall = nil
+        placeholder = "result$"
+      }
+      let result = translatedSignature.result.conversion.render(
+        &printer,
+        placeholder,
+        placeholderForDowncall: placeholderForDowncall,
+      )
+
+      if translatedSignature.result.javaResultType != .void {
+        switch translatedSignature.result.conversion {
+        case .initializeResultWithUpcall(_, let extractResult):
+          printer.print("\(result);") // the result in the callback situation is a series of setup steps
+          let extracted = extractResult.render(&printer, placeholder)
+          printReturnWithOverflowCheck(&printer, value: extracted, overflowCheck: translatedSignature.result.needs32BitIntOverflowCheck)
+        default:
+          printReturnWithOverflowCheck(&printer, value: result, overflowCheck: translatedSignature.result.needs32BitIntOverflowCheck)
+        }
+      } else {
+        printer.print("\(result);")
+      }
+    }
+
+    if translatedSignature.requiresTemporaryArena {
+      printer.outdent()
+      printer.print("}")
+    }
+  }
+
+  /// Print a return statement with an optional 32-bit integer overflow check.
+  private func printReturnWithOverflowCheck(
+    _ printer: inout JavaPrinter,
+    value: String,
+    overflowCheck: OverflowCheckType,
+  ) {
+    switch overflowCheck {
+    case .none:
+      printer.print("return \(value);")
+    case .signedInt:
+      let resultVar = "result$checked"
+      printer.print("long \(resultVar) = \(value);")
+
+      printer.printIfBlock("SwiftValueLayout.has32bitSwiftInt") { printer in
+        printer.printIfBlock("\(resultVar) < Integer.MIN_VALUE || \(resultVar) > Integer.MAX_VALUE") { printer in
+          printer.print("throw new SwiftIntegerOverflowException(\"Return value overflow: \" + \(resultVar));")
+        }
+      }
+      printer.print("return \(resultVar);")
+    case .unsignedInt:
+      let resultVar = "result$checked"
+      printer.print("long \(resultVar) = \(value);")
+
+      printer.printIfBlock("SwiftValueLayout.has32bitSwiftInt") { printer in
+        printer.printIfBlock("\(resultVar) < 0 || \(resultVar) > 0xFFFFFFFFL") { printer in
+          printer.print("throw new SwiftIntegerOverflowException(\"Return value overflow: \" + \(resultVar));")
+        }
+      }
+      printer.print("return \(resultVar);")
+    }
+  }
+
+  func renderMemoryLayoutValue(for javaType: JavaType) -> String {
+    if let layout = ForeignValueLayout(javaType: javaType) {
+      return layout.description
+    } else if case .class(package: _, name: let customClass, _) = javaType {
+      return ForeignValueLayout(customType: customClass).description
+    } else {
+      fatalError("renderMemoryLayoutValue not supported for \(javaType)")
+    }
+  }
+}
+
+extension FFMSwift2JavaGenerator.JavaConversionStep {
+  /// Whether the conversion uses SwiftArena.
+  var requiresSwiftArena: Bool {
+    switch self {
+    case .placeholder, .placeholderForDowncall, .placeholderForSwiftThunkName:
+      return false
+    case .explodedName, .constant, .readMemorySegment, .javaNew:
+      return false
+    case .constructSwiftValue, .wrapMemoryAddressUnsafe:
+      return true
+    case .temporaryArena:
+      return true
+
+    case .initializeResultWithUpcall(let steps, let result):
+      return steps.contains { $0.requiresSwiftArena } || result.requiresSwiftArena
+    case .introduceVariable(_, let value):
+      return value.requiresSwiftArena
+
+    case .call(let inner, let base, _, _):
+      return inner.requiresSwiftArena || (base?.requiresSwiftArena == true)
+
+    case .cast(let inner, _),
+      .construct(let inner, _),
+      .method(let inner, _, _, _),
+      .property(let inner, _),
+      .swiftValueSelfSegment(let inner):
+      return inner.requiresSwiftArena
+
+    case .commaSeparated(let list, _):
+      return list.contains(where: { $0.requiresSwiftArena })
+
+    case .replacingPlaceholder(let inner, _):
+      return inner.requiresSwiftArena
+
+    case .tupleFromOutParams(_, let elements):
+      return elements.contains(where: { $0.elementConversion.requiresSwiftArena })
+    }
+  }
+
+  /// Whether the conversion uses temporary Arena.
+  var requiresTemporaryArena: Bool {
+    switch self {
+    case .placeholder, .placeholderForDowncall, .placeholderForSwiftThunkName:
+      return false
+    case .explodedName, .constant, .javaNew:
+      return false
+    case .temporaryArena:
+      return true
+    case .readMemorySegment:
+      return true
+    case .initializeResultWithUpcall:
+      return true
+    case .introduceVariable(_, let value):
+      return value.requiresTemporaryArena
+    case .cast(let inner, _),
+      .construct(let inner, _),
+      .constructSwiftValue(let inner, _),
+      .swiftValueSelfSegment(let inner),
+      .wrapMemoryAddressUnsafe(let inner, _):
+      return inner.requiresSwiftArena
+    case .call(let inner, let base, _, let withArena):
+      return withArena || (base?.requiresTemporaryArena == true) || inner.requiresTemporaryArena
+    case .method(let inner, _, let args, let withArena):
+      return withArena || inner.requiresTemporaryArena || args.contains(where: { $0.requiresTemporaryArena })
+    case .property(let inner, _):
+      return inner.requiresTemporaryArena
+    case .commaSeparated(let list, _):
+      return list.contains(where: { $0.requiresTemporaryArena })
+
+    case .replacingPlaceholder(let inner, _):
+      return inner.requiresTemporaryArena
+
+    case .tupleFromOutParams(_, let elements):
+      return elements.contains(where: { $0.elementConversion.requiresTemporaryArena })
+    }
+  }
+
+  /// Returns the conversion string applied to the placeholder.
+  func render(_ printer: inout JavaPrinter, _ placeholder: String, placeholderForDowncall: String? = nil) -> String {
+    // NOTE: 'printer' is used if the conversion wants to cause side-effects.
+    // E.g. storing a temporary values into a variable.
+    switch self {
+    case .placeholder:
+      return placeholder
+
+    case .placeholderForDowncall:
+      if let placeholderForDowncall {
+        return "\(placeholderForDowncall)"
+      } else {
+        return "/*placeholderForDowncall undefined!*/"
+      }
+    case .placeholderForSwiftThunkName:
+      if let placeholderForDowncall {
+        let downcall = "\(placeholderForDowncall)"
+        return String(downcall[..<(downcall.firstIndex(of: ".") ?? downcall.endIndex)]) // . separates thunk name from the `.call`
+      } else {
+        return "/*placeholderForDowncall undefined!*/"
+      }
+
+    case .temporaryArena:
+      return "arena$"
+
+    case .explodedName(let component):
+      return "\(placeholder)_\(component)"
+
+    case .swiftValueSelfSegment:
+      return "\(placeholder).$memorySegment()"
+
+    case .javaNew(let value):
+      return "new \(value.render(&printer, placeholder, placeholderForDowncall: placeholderForDowncall))"
+
+    case .initializeResultWithUpcall(let steps, _):
+      // TODO: could we use the printing to introduce the upcall handle instead?
+      return steps.map { step in
+        var printer = JavaPrinter()
+        var out = ""
+        out += step.render(&printer, placeholder, placeholderForDowncall: placeholderForDowncall)
+        out += printer.contents
+        return out
+      }.joined(separator: ";\n")
+
+    case .call(let inner, let base, let function, let withArena):
+      let inner = inner.render(&printer, placeholder)
+      let arenaArg = withArena ? ", arena$" : ""
+      let baseStr: String =
+        if let base {
+          base.render(&printer, placeholder) + "."
+        } else {
+          ""
+        }
+      return "\(baseStr)\(function)(\(inner)\(arenaArg))"
+
+    // TODO: deduplicate with 'method'
+    case .method(let inner, let methodName, let arguments, let withArena):
+      let inner = inner.render(&printer, placeholder, placeholderForDowncall: placeholderForDowncall)
+      let args = arguments.map { $0.render(&printer, placeholder, placeholderForDowncall: placeholderForDowncall) }
+      let argsStr = (args + (withArena ? ["arena$"] : [])).joined(separator: " ,")
+      return "\(inner).\(methodName)(\(argsStr))"
+
+    case .property(let inner, let propertyName):
+      let inner = inner.render(&printer, placeholder, placeholderForDowncall: placeholderForDowncall)
+      return "\(inner).\(propertyName)"
+
+    case .constructSwiftValue(let inner, let javaType):
+      let inner = inner.render(&printer, placeholder, placeholderForDowncall: placeholderForDowncall)
+      return "new \(javaType.className!)(\(inner), swiftArena)"
+
+    case .wrapMemoryAddressUnsafe(let inner, let javaType):
+      let inner = inner.render(&printer, placeholder, placeholderForDowncall: placeholderForDowncall)
+      return "\(javaType.className!).wrapMemoryAddressUnsafe(\(inner), swiftArena)"
+
+    case .construct(let inner, let javaType):
+      let inner = inner.render(&printer, placeholder, placeholderForDowncall: placeholderForDowncall)
+      return "new \(javaType)(\(inner))"
+
+    case .introduceVariable(let name, let value):
+      let value = value.render(&printer, placeholder, placeholderForDowncall: placeholderForDowncall)
+      return "var \(name) = \(value);"
+
+    case .cast(let inner, let javaType):
+      let inner = inner.render(&printer, placeholder, placeholderForDowncall: placeholderForDowncall)
+      return "(\(javaType)) \(inner)"
+
+    case .commaSeparated(let list, let separator):
+      return list.map({
+        $0.render(&printer, placeholder, placeholderForDowncall: placeholderForDowncall)
+      }).joined(separator: separator)
+
+    case .constant(let value):
+      return value
+
+    case .readMemorySegment(let inner, let javaType):
+      let inner = inner.render(&printer, placeholder)
+      return "\(inner).get(\(ForeignValueLayout(javaType: javaType)!), 0)"
+
+    case .replacingPlaceholder(let inner, let root):
+      return inner.render(&printer, root, placeholderForDowncall: placeholderForDowncall)
+
+    case .tupleFromOutParams(let tupleClassName, let elements):
+      let args = elements.map { element in
+        element.elementConversion.render(
+          &printer,
+          element.outParamName,
+          placeholderForDowncall: placeholderForDowncall,
+        )
+      }
+      return "\(tupleClassName)(\(args.joined(separator: .comma)))"
+    }
+  }
+}

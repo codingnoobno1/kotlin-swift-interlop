@@ -1,0 +1,426 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2024 Apple Inc. and the Swift.org project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift.org project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+import SwiftJavaJNICore
+
+/// Produce the mangling for a method with the given argument and result types.
+private func methodMangling<each Param: JavaValue>(
+  parameterTypes: repeat (each Param).Type,
+  resultType: JavaType
+) -> String {
+  var parameterTypesArray: [JavaType] = []
+  for parameterType in repeat each parameterTypes {
+    parameterTypesArray.append(parameterType.javaType)
+  }
+  return MethodSignature(
+    resultType: resultType,
+    parameterTypes: parameterTypesArray
+  ).mangledName
+}
+
+/// Determine the number of arguments in the given parameter pack.
+private func countArgs<each Arg>(_ arg: repeat each Arg) -> Int {
+  var count = 0
+  for _ in repeat each arg {
+    count += 1
+  }
+  return count
+}
+
+/// Create an array of jvalue instances from the provided Java-compatible values.
+private func getJValues<each Arg: JavaValue>(_ arg: repeat each Arg, in environment: JNIEnvironment) -> [jvalue] {
+  .init(unsafeUninitializedCapacity: countArgs(repeat each arg)) { (buffer, initializedCount) in
+    for arg in repeat each arg {
+      buffer[initializedCount] = arg.getJValue(in: environment)
+      initializedCount += 1
+    }
+  }
+}
+
+/// The method name for a Java constructor.
+private let javaConstructorName = "<init>"
+
+extension AnyJavaObject {
+  /// Lookup a Java instance method on the given class given a fixed result type mangling.
+  static func javaMethodLookup<each Param: JavaValue>(
+    thisClass: jclass,
+    methodName: String,
+    parameterTypes: repeat (each Param).Type,
+    resultType: JavaType,
+    in environment: JNIEnvironment
+  ) throws -> jmethodID {
+    // Compute the method signature.
+    let methodSignature = methodMangling(
+      parameterTypes: repeat (each Param).self,
+      resultType: resultType
+    )
+
+    // Look up the method within the class.
+    return try environment.translatingJNIExceptions {
+      environment.interface.GetMethodID(
+        environment,
+        thisClass,
+        methodName,
+        methodSignature
+      )
+    }!
+  }
+
+  /// Lookup a Java instance method on the given class.
+  static func javaMethodLookup<each Param: JavaValue, Result: JavaValue>(
+    thisClass: jclass,
+    methodName: String,
+    parameterTypes: repeat (each Param).Type,
+    resultType: Result.Type,
+    in environment: JNIEnvironment
+  ) throws -> jmethodID {
+    try environment.translatingJNIExceptions {
+      try javaMethodLookup(
+        thisClass: thisClass,
+        methodName: methodName,
+        parameterTypes: repeat each parameterTypes,
+        resultType: Result.javaType,
+        in: environment
+      )
+    }
+  }
+
+  /// Lookup a Java instance method on this instance.
+  func javaMethodLookup<each Param: JavaValue, Result: JavaValue>(
+    methodName: String,
+    parameterTypes: repeat (each Param).Type,
+    resultType: Result.Type
+  ) throws -> jmethodID {
+    // Retrieve the Java class instance from the object.
+    let environment = try JavaVirtualMachine.shared().environment()
+
+    let thisClass = try environment.translatingJNIExceptions {
+      environment.interface.GetObjectClass(environment, javaThis)
+    }!
+    defer { environment.interface.DeleteLocalRef(environment, thisClass) }
+
+    return try environment.translatingJNIExceptions {
+      try Self.javaMethodLookup(
+        thisClass: thisClass,
+        methodName: methodName,
+        parameterTypes: repeat each parameterTypes,
+        resultType: Result.javaType,
+        in: environment
+      )
+    }
+  }
+
+  /// Lookup a void-returnning Java instance method on this instance.
+  func javaMethodLookup<each Param: JavaValue>(
+    methodName: String,
+    parameterTypes: repeat (each Param).Type
+  ) throws -> jmethodID {
+    // Retrieve the Java class instance from the object.
+    let environment = try JavaVirtualMachine.shared().environment()
+
+    let thisClass = try environment.translatingJNIExceptions {
+      environment.interface.GetObjectClass(environment, javaThis)
+    }!
+    defer { environment.interface.DeleteLocalRef(environment, thisClass) }
+
+    return try environment.translatingJNIExceptions {
+      try Self.javaMethodLookup(
+        thisClass: thisClass,
+        methodName: methodName,
+        parameterTypes: repeat each parameterTypes,
+        resultType: .void,
+        in: environment
+      )
+    }
+  }
+
+  /// Call a Java method with the given name and arguments, which must be of the correct
+  /// type, that produces the given result type.
+  static func javaMethodCall<each Param: JavaValue, Result: JavaValue>(
+    in environment: JNIEnvironment,
+    this: jobject,
+    method: jmethodID,
+    args: repeat each Param
+  ) throws -> Result {
+    // Wrap arg creation, the call, and result conversion in a local frame so
+    // that jstring/jarray local refs created by getJValues are freed on exit.
+    let jniMethod = Result.jniMethodCall(in: environment)
+    return try environment.withLocalFrame(capacity: countArgs(repeat each args) + 1) {
+      let jniArgs = getJValues(repeat each args, in: environment)
+      let jniResult = try environment.translatingJNIExceptions {
+        jniMethod(environment, this, method, jniArgs)
+      }
+      return Result(fromJNI: jniResult, in: environment)
+    }
+  }
+
+  /// Call a Java method with the given name and arguments, which must be of the correct
+  /// type, that produces the given result type.
+  func javaMethodCall<each Param: JavaValue, Result: JavaValue>(
+    method: jmethodID,
+    args: repeat each Param
+  ) throws -> Result {
+    let environment = try JavaVirtualMachine.shared().environment()
+
+    return try Self.javaMethodCall(
+      in: environment,
+      this: javaThis,
+      method: method,
+      args: repeat each args
+    )
+  }
+
+  /// Call a Java method with the given name and arguments, which must be of the correct
+  /// type, that produces the given result type.
+  public func dynamicJavaMethodCall<each Param: JavaValue, Result: JavaValue>(
+    methodName: String,
+    arguments: repeat each Param,
+    resultType: Result.Type
+  ) throws -> Result {
+    let methodID = try javaMethodLookup(
+      methodName: methodName,
+      parameterTypes: repeat (each Param).self,
+      resultType: Result.self
+    )
+    return try javaMethodCall(
+      method: methodID,
+      args: repeat each arguments
+    )
+  }
+
+  /// Call a Java method with the given name and arguments, which must be of the correct
+  /// type, that produces the given result type.
+  public func dynamicJavaMethodCall<each Param: JavaValue>(
+    methodName: String,
+    arguments: repeat each Param
+  ) throws {
+    let methodID = try javaMethodLookup(methodName: methodName, parameterTypes: repeat (each Param).self)
+    return try javaMethodCall(
+      method: methodID,
+      args: repeat each arguments
+    )
+  }
+
+  /// Call a Java method with the given name and arguments, which must be of the correct
+  /// type, that returns void..
+  static func javaMethodCall<each Param: JavaValue>(
+    in environment: JNIEnvironment,
+    this: jobject,
+    method: jmethodID,
+    args: repeat each Param
+  ) throws {
+    // Wrap arg creation and the call in a local frame so that jstring/jarray
+    // local refs created by getJValues are freed on exit.
+    let jniMethod = environment.interface.CallVoidMethodA!
+    try environment.withLocalFrame(capacity: countArgs(repeat each args) + 1) {
+      let jniArgs = getJValues(repeat each args, in: environment)
+      try environment.translatingJNIExceptions {
+        jniMethod(environment, this, method, jniArgs)
+      }
+    }
+  }
+
+  /// Call a Java method with the given name and arguments, which must be of the correct
+  /// type, that returns void..
+  func javaMethodCall<each Param: JavaValue>(
+    method: jmethodID,
+    args: repeat each Param
+  ) throws {
+    let environment = try JavaVirtualMachine.shared().environment()
+
+    try Self.javaMethodCall(
+      in: environment,
+      this: javaThis,
+      method: method,
+      args: repeat each args
+    )
+  }
+
+  /// Construct a new Java object with the given name and arguments and return
+  /// the result Java instance.
+  public static func dynamicJavaNewObject<each Param: JavaValue>(
+    in environment: JNIEnvironment,
+    arguments: repeat each Param
+  ) throws -> Self {
+    let this = try dynamicJavaNewObjectInstance(in: environment, arguments: repeat each arguments)
+    return Self(javaThis: this, environment: environment)
+  }
+
+  /// Construct a new Java object with the given name and arguments and return
+  /// the result Java instance.
+  public static func dynamicJavaNewObjectInstance<each Param: JavaValue>(
+    in environment: JNIEnvironment,
+    arguments: repeat each Param
+  ) throws -> jobject {
+    try Self.withJNIClass(in: environment) { thisClass in
+      // Compute the method signature so we can find the right method, then look up the
+      // method within the class.
+      let methodID = try Self.javaMethodLookup(
+        thisClass: thisClass,
+        methodName: javaConstructorName,
+        parameterTypes: repeat (each Param).self,
+        resultType: .void,
+        in: environment
+      )
+
+      // Wrap arg creation and the constructor call in a local frame, promoting
+      // the new object's local ref to the outer frame so the caller can wrap
+      // it in a JavaObjectHolder (which will then delete that promoted ref).
+      return try environment.withLocalFramePromotingResult(
+        capacity: countArgs(repeat each arguments) + 1
+      ) {
+        let jniArgs = getJValues(repeat each arguments, in: environment)
+        return try environment.translatingJNIExceptions {
+          environment.interface.NewObjectA!(environment, thisClass, methodID, jniArgs)
+        }!
+      }!
+    }
+  }
+
+  /// Retrieve the JNI field ID for a field with the given name and type.
+  private func getJNIFieldID<FieldType: JavaValue>(_ fieldName: String, fieldType: FieldType.Type) -> jfieldID?
+  where FieldType: ~Copyable {
+    let this = javaThis
+    let environment = try! JavaVirtualMachine.shared().environment()
+
+    // Retrieve the Java class instance from the object.
+    let thisClass = environment.interface.GetObjectClass(environment, this)!
+    defer { environment.interface.DeleteLocalRef(environment, thisClass) }
+
+    return environment.interface.GetFieldID(environment, thisClass, fieldName, FieldType.jniMangling)
+  }
+
+  public subscript<FieldType: JavaValue>(
+    javaFieldName fieldName: String,
+    fieldType fieldType: FieldType.Type
+  ) -> FieldType where FieldType: ~Copyable {
+    get {
+      let environment = try! JavaVirtualMachine.shared().environment()
+
+      let fieldID = getJNIFieldID(fieldName, fieldType: fieldType)!
+      let jniMethod = FieldType.jniFieldGet(in: environment)
+      return FieldType(fromJNI: jniMethod(environment, javaThis, fieldID), in: environment)
+    }
+
+    nonmutating set {
+      let environment = try! JavaVirtualMachine.shared().environment()
+
+      let fieldID = getJNIFieldID(fieldName, fieldType: fieldType)!
+      let jniMethod = FieldType.jniFieldSet(in: environment)
+      try! environment.withLocalFrame(capacity: 1) {
+        jniMethod(environment, javaThis, fieldID, newValue.getJNIValue(in: environment))
+      }
+    }
+  }
+}
+
+extension JavaClass {
+  /// Call a Java static method with the given name and arguments, which must be
+  /// of the correct type, that produces the given result type.
+  public func dynamicJavaStaticMethodCall<each Param: JavaValue, Result: JavaValue>(
+    methodName: String,
+    arguments: repeat each Param,
+    resultType: Result.Type
+  ) throws -> Result {
+    let thisClass = javaThis
+    let environment = try! JavaVirtualMachine.shared().environment()
+
+    // Compute the method signature so we can find the right method, then look up the
+    // method within the class.
+    let methodSignature = methodMangling(
+      parameterTypes: repeat (each Param).self,
+      resultType: Result.javaType
+    )
+    let methodID = try environment.translatingJNIExceptions {
+      environment.interface.GetStaticMethodID(
+        environment,
+        thisClass,
+        methodName,
+        methodSignature
+      )
+    }!
+
+    let jniMethod = Result.jniStaticMethodCall(in: environment)
+    return try environment.withLocalFrame(capacity: countArgs(repeat each arguments) + 1) {
+      let jniArgs = getJValues(repeat each arguments, in: environment)
+      let jniResult = try environment.translatingJNIExceptions {
+        jniMethod(environment, thisClass, methodID, jniArgs)
+      }
+      return Result(fromJNI: jniResult, in: environment)
+    }
+  }
+
+  /// Call a Java static method with the given name and arguments, which must be
+  /// of the correct type, that produces the given result type.
+  public func dynamicJavaStaticMethodCall<each Param: JavaValue>(
+    methodName: String,
+    arguments: repeat each Param
+  ) throws {
+    let thisClass = javaThis
+    let environment = try JavaVirtualMachine.shared().environment()
+
+    // Compute the method signature so we can find the right method, then look up the
+    // method within the class.
+    let methodSignature = methodMangling(
+      parameterTypes: repeat (each Param).self,
+      resultType: .void
+    )
+    let methodID = try environment.translatingJNIExceptions {
+      environment.interface.GetStaticMethodID(
+        environment,
+        thisClass,
+        methodName,
+        methodSignature
+      )
+    }!
+
+    let jniMethod = environment.interface.CallStaticVoidMethodA
+    try environment.withLocalFrame(capacity: countArgs(repeat each arguments) + 1) {
+      let jniArgs = getJValues(repeat each arguments, in: environment)
+      try environment.translatingJNIExceptions {
+        jniMethod!(environment, thisClass, methodID, jniArgs)
+      }
+    }
+  }
+
+  /// Retrieve the JNI field ID for a field with the given name and type.
+  private func getJNIStaticFieldID<FieldType: JavaValue>(_ fieldName: String, fieldType: FieldType.Type) -> jfieldID? {
+    let environment = try! JavaVirtualMachine.shared().environment()
+
+    return environment.interface.GetStaticFieldID(environment, javaThis, fieldName, FieldType.jniMangling)
+  }
+
+  public subscript<FieldType: JavaValue>(
+    javaFieldName fieldName: String,
+    fieldType fieldType: FieldType.Type
+  ) -> FieldType {
+    get {
+      let environment = try! JavaVirtualMachine.shared().environment()
+
+      let fieldID = getJNIStaticFieldID(fieldName, fieldType: fieldType)!
+      let jniMethod = FieldType.jniStaticFieldGet(in: environment)
+      return FieldType(fromJNI: jniMethod(environment, javaThis, fieldID), in: environment)
+    }
+
+    set {
+      let environment = try! JavaVirtualMachine.shared().environment()
+
+      let fieldID = getJNIStaticFieldID(fieldName, fieldType: fieldType)!
+      let jniMethod = FieldType.jniStaticFieldSet(in: environment)
+      try! environment.withLocalFrame(capacity: 1) {
+        jniMethod(environment, javaThis, fieldID, newValue.getJNIValue(in: environment))
+      }
+    }
+  }
+}

@@ -1,0 +1,170 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2025 Apple Inc. and the Swift.org project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift.org project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+import Foundation
+import JavaNet
+import JavaUtilJar
+import Subprocess
+@_spi(Testing) import SwiftJava
+import SwiftJavaConfigurationShared
+import SwiftJavaShared
+import XCTest // NOTE: Workaround for https://github.com/swiftlang/swift-java/issues/43
+
+@testable import SwiftJavaToolLib
+
+/// Returns the directory that should be added to the classpath of the JVM to analyze the sources.
+func compileJava(_ sourceText: String) async throws -> Foundation.URL {
+  try await CompileJavaTool.compileJava(sourceText)
+}
+
+func withJavaTranslator(
+  javaClassNames: [String],
+  classpath: [Foundation.URL],
+  body: (JavaTranslator) throws -> Void,
+  function: String = #function,
+  file: StaticString = #filePath,
+  line: UInt = #line
+) throws {
+  print("New withJavaTranslator, for classpath: \(classpath)")
+  let jvm = try JavaVirtualMachine.shared(
+    classpath: classpath.map(\.path),
+    replace: true
+  )
+
+  var config = Configuration()
+  config.minimumInputAccessLevelMode = .package
+
+  let environment = try jvm.environment()
+  let translator = JavaTranslator(
+    config: config,
+    swiftModuleName: "SwiftModule",
+    environment: environment,
+    translateAsClass: true
+  )
+
+  try body(translator)
+}
+
+/// Translate a Java class and assert that the translated output contains
+/// each of the expected "chunks" of text.
+func assertWrapJavaOutput(
+  javaClassNames: [String],
+  classNameMappings: [String: String] = [:],
+  classpath: [Foundation.URL],
+  makeJar: Bool = false,
+  androidAPIVersions: AndroidAPIVersions? = nil,
+  assert assertBody: (JavaTranslator) throws -> Void = { _ in },
+  expectedChunks: [String],
+  function: String = #function,
+  file: StaticString = #filePath,
+  line: UInt = #line
+) throws {
+  let jvm = try JavaVirtualMachine.shared(
+    //classpath: classpath.map(\.path),
+    replace: false
+  )
+  // Do NOT destroy the jvm here, because the JavaClasses will need to deinit,
+  // and do so while the env is still valid...
+
+  var config = Configuration()
+  config.minimumInputAccessLevelMode = .package
+
+  let environment = try jvm.environment()
+  let translator = JavaTranslator(
+    config: config,
+    swiftModuleName: "SwiftModule",
+    environment: environment,
+    translateAsClass: true
+  )
+  translator.androidAPIVersions = androidAPIVersions
+
+  let classpathJavaURLs: [JavaURL]
+  if makeJar {
+    // Convert each classpath directory into a JAR and use those as classpath entries
+    classpathJavaURLs = classpath.map { classpathDir in
+      let jarFile = classpathDir.deletingLastPathComponent()
+        .appendingPathComponent("test-\(UUID().uuidString).jar")
+      // Synchronously create the JAR using Process
+      let process = Process()
+      process.executableURL = Foundation.URL(fileURLWithPath: "\(javaHome)/bin/jar")
+      process.arguments = ["cf", jarFile.path, "-C", classpathDir.path, "."]
+      try! process.run()
+      process.waitUntilExit()
+      guard process.terminationStatus == 0 else {
+        fatalError("jar failed with exit code \(process.terminationStatus)")
+      }
+      print("Created JAR: \(jarFile)")
+      return try! URI("\(jarFile)").toURL()
+    }
+  } else {
+    classpathJavaURLs = classpath.map({ try! URI("\($0)/").toURL() }) // we MUST have a trailing slash for JVM to consider it a search directory
+  }
+  let classLoader = URLClassLoader(classpathJavaURLs, environment: environment)
+
+  // FIXME: deduplicate this
+  translator.startNewFile()
+
+  var swiftCompleteOutputText = ""
+
+  var javaClasses: [JavaClass<JavaObject>] = []
+  for javaClassName in javaClassNames {
+    guard let javaClass = try! classLoader.loadClass(javaClassName) else {
+      fatalError("Could not load Java class '\(javaClassName)' in test \(function) @ \(file):\(line)!")
+    }
+    javaClasses.append(javaClass)
+
+    // FIXME: deduplicate this with SwiftJava.WrapJavaCommand.runCommand !!!
+    // TODO: especially because nested classes
+    // WrapJavaCommand().<TODO>
+
+    let swiftUnqualifiedName =
+      classNameMappings[javaClassName]
+      ?? javaClassName.javaClassNameToCanonicalName.defaultSwiftNameForJavaClass
+    translator.translatedClasses[javaClassName] =
+      .init(module: nil, name: swiftUnqualifiedName)
+
+    try translator.validateClassConfiguration()
+
+    let swiftClassDecls = try translator.translateClass(javaClass)
+    let importDecls = translator.getImportDecls()
+
+    let swiftFileText =
+      """
+      // ---------------------------------------------------------------------------
+      // Auto-generated by Java-to-Swift wrapper generator.
+      \(importDecls.map { $0.description }.joined())
+      \(swiftClassDecls.map { $0.description }.joined(separator: "\n"))
+      \n
+      """
+    swiftCompleteOutputText += swiftFileText
+  }
+
+  // Run any additional user defined assertions:
+  try assertBody(translator)
+
+  for expectedChunk in expectedChunks {
+    // We make the matching in-sensitive to whitespace:
+    let checkAgainstText = swiftCompleteOutputText.replacing(" ", with: "")
+    let checkAgainstExpectedChunk = expectedChunk.replacing(" ", with: "")
+
+    let failureMessage =
+      "Expected chunk: \n" + "\(expectedChunk.yellow)" + "\n" + "not found in:\n" + "\(swiftCompleteOutputText)"
+    XCTAssertTrue(
+      checkAgainstText.contains(checkAgainstExpectedChunk),
+      "\(failureMessage)",
+      file: file,
+      line: line
+    )
+  }
+}

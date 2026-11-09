@@ -1,0 +1,39 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2025 Apple Inc. and the Swift.org project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift.org project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+public class ConcreteProtocolAB: ProtocolA, ProtocolB {
+  public let constantA: Int64
+  public let constantB: Int64
+  public var mutable: Int64 = 0
+
+  public init(constantA: Int64, constantB: Int64) {
+    self.constantA = constantA
+    self.constantB = constantB
+  }
+
+  public func name() -> String {
+    "ConcreteProtocolAB"
+  }
+
+  public func makeClass() -> MySwiftClass {
+    MySwiftClass(x: 10, y: 50)
+  }
+}
+
+/// Returns a **reference-type** (class) `ProtocolA` conformer boxed as `any
+/// ProtocolA`, to exercise existential-box setter write-back against a
+/// class conformer.
+public func makeProtocolAClass(constantA: Int64, constantB: Int64) -> any ProtocolA {
+  ConcreteProtocolAB(constantA: constantA, constantB: constantB)
+}

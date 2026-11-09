@@ -1,0 +1,142 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2024 Apple Inc. and the Swift.org project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift.org project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+import SwiftJava
+import SwiftJavaJNICore
+
+/// A cache used to hold references for JNI method and classes.
+///
+/// This type is used internally in by the outputted JExtract wrappers
+/// to improve performance of any JNI lookups.
+public final class _JNIMethodIDCache: Sendable {
+  public struct Method: Hashable, Sendable {
+    public let name: String
+    public let signature: String
+    public let isStatic: Bool
+
+    public init(name: String, signature: String, isStatic: Bool = false) {
+      self.name = name
+      self.signature = signature
+      self.isStatic = isStatic
+    }
+  }
+
+  public struct Field: Hashable, Sendable {
+    public let name: String
+    public let signature: String
+    public let isStatic: Bool
+
+    public init(name: String, signature: String, isStatic: Bool = false) {
+      self.name = name
+      self.signature = signature
+      self.isStatic = isStatic
+    }
+  }
+
+  nonisolated(unsafe) let _class: jclass?
+  nonisolated(unsafe) let methods: [Method: jmethodID]
+  nonisolated(unsafe) let fields: [Field: jfieldID]
+
+  public var javaClass: jclass {
+    self._class!
+  }
+
+  /// An optional reference to a java object holder
+  /// if we cached this class through the class loader
+  /// This is to make sure that the underlying reference remains valid
+  nonisolated(unsafe) private let javaObjectHolder: JavaObjectHolder?
+
+  public init(className: String, methods: [Method] = [], fields: [Field] = []) {
+    let environment = try! JavaVirtualMachine.shared().environment()
+
+    // Android core library desugaring relocates some `java.*` classes to `j$.*` in the consuming
+    // app; this is a no-op everywhere else. See `AndroidSupport` for details.
+    let resolvedClassName = AndroidSupport.androidDesugarClassNameConversionWithSlashes(for: className)
+
+    let clazz: jobject
+    if let jniClass = environment.interface.FindClass(environment, resolvedClassName) {
+      clazz = environment.interface.NewGlobalRef(environment, jniClass)!
+      environment.interface.DeleteLocalRef(environment, jniClass)
+      self.javaObjectHolder = nil
+    } else {
+      // Clear any ClassNotFound exceptions from FindClass
+      environment.interface.ExceptionClear(environment)
+
+      // OK to force unwrap, we are in a jextract environment.
+      guard let jni = JNI.shared else {
+        fatalError("Cannot get JNI.shared, it should have been initialized by JNI_OnLoad when loading the library")
+      }
+      guard
+        let javaClass = try? jni.applicationClassLoader?.loadClass(
+          resolvedClassName.replacing("/", with: ".")
+        )
+      else {
+        fatalError("Class \(resolvedClassName) could not be found!")
+      }
+
+      clazz = javaClass.javaThis
+      self.javaObjectHolder = javaClass.javaHolder
+    }
+
+    self._class = clazz
+    self.methods = methods.reduce(into: [:]) { (result, method) in
+      let signature = AndroidSupport.androidDesugarMethodSignatureConversion(for: method.signature)
+      if method.isStatic {
+        if let methodID = environment.interface.GetStaticMethodID(environment, clazz, method.name, signature) {
+          result[method] = methodID
+        } else {
+          fatalError(
+            "Static method \(method.name) with signature \(signature) not found in class \(resolvedClassName)"
+          )
+        }
+      } else {
+        if let methodID = environment.interface.GetMethodID(environment, clazz, method.name, signature) {
+          result[method] = methodID
+        } else {
+          fatalError("Method \(method.name) with signature \(signature) not found in class \(resolvedClassName)")
+        }
+      }
+    }
+    self.fields = fields.reduce(into: [:]) { (result, field) in
+      let signature = AndroidSupport.androidDesugarMethodSignatureConversion(for: field.signature)
+      if field.isStatic {
+        if let fieldID = environment.interface.GetStaticFieldID(environment, clazz, field.name, signature) {
+          result[field] = fieldID
+        } else {
+          fatalError(
+            "Static field \(field.name) with signature \(signature) not found in class \(resolvedClassName)"
+          )
+        }
+      } else {
+        if let fieldID = environment.interface.GetFieldID(environment, clazz, field.name, signature) {
+          result[field] = fieldID
+        } else {
+          fatalError("field \(field.name) with signature \(signature) not found in class \(resolvedClassName)")
+        }
+      }
+    }
+  }
+
+  public subscript(_ method: Method) -> jmethodID? {
+    methods[method]
+  }
+
+  public subscript(_ field: Field) -> jfieldID? {
+    fields[field]
+  }
+
+  public func cleanup(environment: UnsafeMutablePointer<JNIEnv?>!) {
+    environment.interface.DeleteGlobalRef(environment, self._class)
+  }
+}

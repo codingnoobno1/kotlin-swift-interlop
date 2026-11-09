@@ -1,0 +1,136 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2025 Apple Inc. and the Swift.org project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift.org project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+import SwiftJava
+
+public class MySwiftClass {
+  public let x: Int64
+  public let y: Int64
+
+  public let byte: UInt8 = 0
+  public let constant: Int64 = 100
+  public var mutable: Int64 = 0
+  // snippet.computedProperties
+  public var product: Int64 {
+    x * y
+  }
+  public var throwingVariable: Int64 {
+    get throws {
+      throw MySwiftClassError.swiftError
+    }
+  }
+  public var mutableDividedByTwo: Int64 {
+    get {
+      mutable / 2
+    }
+    set {
+      mutable = newValue * 2
+    }
+  }
+  // snippet.end
+  public let warm: Bool = false
+  public var getAsync: Int64 {
+    get async {
+      42
+    }
+  }
+
+  /// `public private(set)` should expose only a getter to Java; the setter
+  /// is unreachable so swift-java must not emit a setter thunk for it
+  // snippet.privateSetProperty
+  public private(set) var privateSetCounter: Int64 = 7
+  // snippet.end
+
+  public static func method() {
+  }
+
+  // snippet.classMembers
+  public class func classMethod(x: Int64) -> Int64 {
+    x * 2
+  }
+
+  public class var classVariable: Int64 {
+    42
+  }
+  // snippet.end
+
+  // snippet.initializers
+  public init(x: Int64, y: Int64) {
+    self.x = x
+    self.y = y
+  }
+
+  public init() {
+    self.x = 10
+    self.y = 5
+  }
+  // snippet.end
+
+  // snippet.throwingInitDefinition
+  convenience public init(throwing: Bool) throws {
+    if throwing {
+      throw MySwiftError.swiftError
+    } else {
+      self.init()
+    }
+  }
+  // snippet.end
+
+  deinit {
+  }
+
+  public func sum() -> Int64 {
+    x + y
+  }
+
+  public func xMultiplied(by z: Int64) -> Int64 {
+    x * z
+  }
+
+  enum MySwiftClassError: Error {
+    case swiftError
+  }
+
+  public func throwingFunction() throws {
+    throw MySwiftClassError.swiftError
+  }
+
+  public func sumX(with other: MySwiftClass) -> Int64 {
+    self.x + other.x
+  }
+
+  public func copy() -> MySwiftClass {
+    MySwiftClass(x: self.x, y: self.y)
+  }
+
+  public func addXWithJavaLong(_ other: JavaLong) -> Int64 {
+    self.x + other.longValue()
+  }
+
+  public func returnXAsJavaLong() -> JavaLong {
+    JavaLong(self.x)
+  }
+}
+
+extension MySwiftClass: CustomStringConvertible {
+  public var description: String {
+    "MySwiftClass(x: \(x), y: \(y))"
+  }
+}
+
+extension MySwiftClass: CustomDebugStringConvertible {
+  public var debugDescription: String {
+    "debug: MySwiftClass(x: \(x), y: \(y))"
+  }
+}

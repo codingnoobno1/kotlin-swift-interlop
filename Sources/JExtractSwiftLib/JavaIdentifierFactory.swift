@@ -1,0 +1,191 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2025 Apple Inc. and the Swift.org project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift.org project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+import SwiftExtract
+
+/// Detects Java method name conflicts caused by Swift overloads that differ
+/// only in parameter labels. When a conflict is detected, the affected methods
+/// get a camelCase suffix derived from their parameter labels (e.g. `takeValueA`,
+/// `takeValueB`) so that Java can distinguish them.
+package struct JavaIdentifierFactory {
+  private var duplicates: Set<String> = []
+
+  package init() {}
+
+  package init(_ methods: [ExtractedFunc]) {
+    self.init()
+    record(methods)
+  }
+
+  /// Analyze the given methods and record any base names that have conflicts.
+  private mutating func record(_ methods: [ExtractedFunc]) {
+    // Group methods by their Java base name.
+    var methodsByBaseName: [String: [ExtractedFunc]] = [:]
+    for method in methods {
+      let baseName: String =
+        switch method.apiKind {
+        case .getter, .subscriptGetter: method.javaGetterName!
+        case .setter, .subscriptSetter: method.javaSetterName!
+        case .function, .initializer, .enumCase, .binaryOperator, .prefixOperator, .postfixOperator: method.name
+        }
+      methodsByBaseName[baseName, default: []].append(method)
+    }
+
+    // For each group with 2+ methods, check if any two share the same
+    // Swift parameter types (which means identical Java parameter types).
+    for (baseName, group) in methodsByBaseName where group.count > 1 {
+      var seenSignatures: Set<String> = []
+      for method in group {
+        let key = method.functionSignature.parameters
+          .map { $0.type.description }
+          .joined(separator: ",")
+        if !seenSignatures.insert(key).inserted {
+          duplicates.insert(baseName)
+          break
+        }
+      }
+    }
+  }
+
+  package func needsSuffix(for baseName: String) -> Bool {
+    duplicates.contains(baseName)
+  }
+
+  /// Compute the disambiguated Java method name for a declaration.
+  package func makeJavaMethodName(_ decl: ExtractedFunc) -> String {
+    let baseName: String =
+      switch decl.apiKind {
+      case .getter, .subscriptGetter: decl.javaGetterName!
+      case .setter, .subscriptSetter: decl.javaSetterName!
+      case .function, .initializer, .enumCase: decl.name
+      case .binaryOperator, .prefixOperator, .postfixOperator:
+        Self.javaOperatorName(decl.name)
+      }
+    var methodName = baseName + paramsSuffix(decl, baseName: baseName)
+    if Self.javaKeywords.contains(methodName) || Self.finalObjectMethods.contains(methodName) {
+      methodName += "_"
+    }
+    return methodName
+  }
+
+  private func paramsSuffix(_ decl: ExtractedFunc, baseName: String) -> String {
+    switch decl.apiKind {
+    case .getter, .subscriptGetter, .setter, .subscriptSetter:
+      return ""
+    default:
+      guard needsSuffix(for: baseName) else { return "" }
+      if decl.functionSignature.parameters.isEmpty {
+        // A parameterless function that still conflicts (e.g. with a property
+        // getter) gets a bare "_" so it compiles as a distinct Java method.
+        return "_"
+      }
+      let labels = decl.functionSignature.parameters.compactMap(\.argumentLabel)
+      // Join labels in camelCase: takeValue(a:) → takeValueA
+      return labels.map { $0.prefix(1).uppercased() + $0.dropFirst() }.joined()
+    }
+  }
+
+  private static func javaOperatorName(_ swiftName: String) -> String {
+    var index = swiftName.startIndex
+    var javaName = ""
+
+    while index < swiftName.endIndex {
+      let isFirstToken = index == swiftName.startIndex
+      let oneCharacterEndIndex = swiftName.index(after: index)
+      let oneCharacterToken = String(swiftName[index..<oneCharacterEndIndex])
+      var tokenEndIndex: String.Index = oneCharacterEndIndex
+      var tokenName = knownOperatorNames[oneCharacterToken] ?? "operator"
+
+      // Prefer a known two-character token if it exists, e.g. `==` instead of `=` + `=`.
+      if oneCharacterEndIndex < swiftName.endIndex {
+        let twoCharacterEndIndex = swiftName.index(after: oneCharacterEndIndex)
+        let twoCharacterToken = String(swiftName[index..<twoCharacterEndIndex])
+        if let knownName = knownOperatorNames[twoCharacterToken] {
+          tokenEndIndex = twoCharacterEndIndex
+          tokenName = knownName
+        }
+      }
+
+      javaName += isFirstToken ? tokenName : tokenName.firstCharacterUppercased
+      index = tokenEndIndex
+    }
+
+    return javaName
+  }
+
+  private static let knownOperatorNames: [String: String] = [
+    "+": "plus",
+    "-": "minus",
+    "*": "times",
+    "/": "dividedBy",
+    "%": "remainder",
+    "<<": "shiftedLeft",
+    ">>": "shiftedRight",
+    "|": "bitwiseOr",
+    "~": "bitwiseNot",
+    "==": "isEqual",
+    "!=": "isNotEqual",
+    "<": "lessThan",
+    "<=": "lessThanOrEqual",
+    ">": "greaterThan",
+    ">=": "greaterThanOrEqual",
+    "&": "bitwiseAnd",
+    "^": "bitwiseXor",
+    "??": "coalescingNil",
+    "!": "logicalNot",
+    "=": "equal",
+    "&&": "and",
+    "||": "or",
+    ".": "dot",
+  ]
+
+  static let javaKeywords: Set<String> = [
+    /// https://docs.oracle.com/javase/specs/jls/se25/html/jls-3.html#jls-3.9
+    "abstract", "continue", "for", "new", "switch",
+    "assert", "default", "if", "package", "synchronized",
+    "boolean", "do", "goto", "private", "this",
+    "break", "double", "implements", "protected", "throw",
+    "byte", "else", "import", "public", "throws",
+    "case", "enum", "instanceof", "return", "transient",
+    "catch", "extends", "int", "short", "try",
+    "char", "final", "interface", "static", "void",
+    "class", "finally", "long", "strictfp", "volatile",
+    "const", "float", "native", "super", "while",
+    "_",
+
+    /// literals
+    "true", "false", "null",
+  ]
+
+  /// Final methods of `java.lang.Object`, which a generated method can't declare again.
+  static let finalObjectMethods: Set<String> = ["getClass", "notify", "notifyAll", "wait"]
+
+  /// Swift keywords that can't name a parameter or a local variable without backticks.
+  static let reservedSwiftKeywords: Set<String> = [
+    "associatedtype", "class", "deinit", "enum", "extension", "fileprivate", "func", "import", "init", "inout",
+    "internal", "let", "operator", "precedencegroup", "private", "protocol", "public", "rethrows", "static",
+    "struct", "subscript", "typealias", "var", "break", "case", "catch", "continue", "default", "defer", "do",
+    "else", "fallthrough", "for", "guard", "if", "in", "repeat", "return", "switch", "throw", "where", "while",
+    "Any", "as", "false", "is", "nil", "self", "Self", "super", "throws", "true", "try",
+  ]
+}
+
+extension String {
+  /// This name, made usable as a parameter or local variable in both the generated Java and Swift: a Java or
+  /// Swift keyword such as `long` or `default` gets a `_` suffix.
+  package var javaSafeIdentifier: String {
+    JavaIdentifierFactory.javaKeywords.contains(self) || JavaIdentifierFactory.reservedSwiftKeywords.contains(self)
+      ? self + "_" : self
+  }
+}

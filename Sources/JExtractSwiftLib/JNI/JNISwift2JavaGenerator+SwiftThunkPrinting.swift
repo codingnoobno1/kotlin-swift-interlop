@@ -1,0 +1,1293 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2024 Apple Inc. and the Swift.org project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift.org project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+import CodePrinting
+import SwiftExtract
+import SwiftJavaJNICore
+import SwiftSyntax
+
+#if canImport(FoundationEssentials)
+import FoundationEssentials
+#else
+import Foundation
+#endif
+
+
+extension JNISwift2JavaGenerator {
+  func writeSwiftThunkSources() throws {
+    var printer = SwiftPrinter()
+    try writeSwiftThunkSources(&printer)
+  }
+
+  package func writeSwiftExpectedEmptySources() throws {
+    let pendingFileCount = self.expectedOutputSwiftFileNames.count
+    guard pendingFileCount > 0 else {
+      return // no need to write any empty files, yay
+    }
+
+    logger.debug(
+      "Write empty [\(self.expectedOutputSwiftFileNames.count)] 'expected' files in: \(swiftOutputDirectory)/"
+    )
+
+    // FIXME(SwiftPM): We'd like to avoid having to write these blank files
+    for expectedFileName in self.expectedOutputSwiftFileNames {
+      logger.trace("Write SwiftPM-'expected' empty file: \(expectedFileName.bold)")
+
+      var printer = SwiftPrinter()
+      printer.print("// Empty file generated on purpose")
+      _ = try printer.writeContents(
+        outputDirectory: self.swiftOutputDirectory,
+        javaPackagePath: nil,
+        filename: expectedFileName,
+      )
+    }
+  }
+
+  package func writeSwiftThunkSources(_ printer: inout SwiftPrinter) throws {
+    let moduleFilenameBase = "\(self.swiftModuleName)Module+SwiftJava"
+    let moduleFilename = "\(moduleFilenameBase).swift"
+
+    do {
+      // Skip the module-level .swift file when generating for a single type
+      if config.singleType == nil {
+        logger.trace("Printing swift module class: \(moduleFilename)")
+
+        try printGlobalSwiftThunkSources(&printer)
+
+        if let outputFile = try printer.writeContents(
+          outputDirectory: self.swiftOutputDirectory,
+          javaPackagePath: nil,
+          filename: moduleFilename,
+        ) {
+          logger.info("Generated: \(moduleFilenameBase.bold).swift (at \(outputFile.absoluteString))")
+          self.expectedOutputSwiftFileNames.remove(moduleFilename)
+        }
+      }
+
+      // === All types
+      // We have to write all types to their corresponding output file that matches the file they were declared in,
+      // because otherwise SwiftPM plugins will not pick up files apropriately -- we expect 1 output +SwiftJava.swift file for every input.
+
+      let filteredTypes: [String: ExtractedNominalType]
+      if let singleType = config.singleType {
+        filteredTypes = self.analysis.extractedTypes.filter { $0.key == singleType }
+      } else {
+        filteredTypes = self.analysis.extractedTypes
+      }
+
+      for group: (key: String, value: [Dictionary<String, ExtractedNominalType>.Element]) in Dictionary(
+        grouping: filteredTypes,
+        by: { $0.value.sourceFilePath },
+      ) {
+        logger.warning("Writing types in file group: \(group.key): \(group.value.map(\.key))")
+
+        let extractedTypesForThisFile = group.value
+          .map(\.value)
+          .sorted(by: { $0.qualifiedName < $1.qualifiedName })
+
+        let inputFileName = "\(group.key)".split { $0 == "/" || $0 == "\\" }.last ?? "__Unknown.swift"
+        let filename = "\(inputFileName)".replacing(/\.swift(interface)?/, with: "+SwiftJava.swift")
+
+        for ty in extractedTypesForThisFile {
+          logger.info("Printing Swift thunks for type: \(ty.effectiveJavaName.bold)")
+          printer.printSeparator("Thunks for \(ty.effectiveJavaName)")
+
+          do {
+            try printNominalTypeThunks(&printer, ty)
+          } catch {
+            logger.warning(
+              "Failed to print to Swift thunks for type'\(ty.effectiveJavaName)' to '\(filename)', error: \(error)"
+            )
+          }
+
+        }
+
+        logger.warning("Write Swift thunks file: \(filename.bold)")
+        do {
+          if let outputFile = try printer.writeContents(
+            outputDirectory: self.swiftOutputDirectory,
+            javaPackagePath: nil,
+            filename: filename,
+          ) {
+            logger.info("Done writing Swift thunks to: \(outputFile.absoluteString)")
+            self.expectedOutputSwiftFileNames.remove(filename)
+          }
+        } catch {
+          logger.warning("Failed to write to Swift thunks: \(filename), error: \(error)")
+        }
+      }
+    } catch {
+      logger.warning("Failed to write to Swift thunks: \(moduleFilename)")
+    }
+  }
+
+  /// Writes a linker version script to the path specified by
+  /// ``Configuration/linkerExportListOutput``, listing every JNI ``@_cdecl``
+  /// symbol generated during this run as global exports and hiding everything
+  /// else with `local: *`.
+  ///
+  /// Pass the resulting file to the linker with:
+  /// ```
+  /// -Xlinker --version-script=<path>
+  /// ```
+  /// This lets lld treat only the JNI entry points as roots during link-time
+  /// dead-code elimination and hides all internal Swift symbols from the
+  /// dynamic symbol table, removing unreachable Swift code from SPM
+  /// dependencies and the Swift standard library.
+  func writeLinkerExportList() throws {
+    guard let outputPath = config.linkerExportListOutput else {
+      return
+    }
+    guard !generatedCDeclSymbolNames.isEmpty else {
+      return
+    }
+
+    let allSymbols = generatedCDeclSymbolNames + ["JNI_OnLoad"]
+
+    let symbolLines =
+      allSymbols
+      .sorted()
+      .map { "  \($0);" }
+      .joined(separator: "\n")
+    let contents =
+      """
+      {
+        global:
+        \(symbolLines)
+        local: *;
+      };
+      """
+
+    try contents.write(
+      toFile: outputPath,
+      atomically: true,
+      encoding: .utf8,
+    )
+    logger.info("[swift-java] Generated linker export list (\(allSymbols.count) symbols): \(outputPath)")
+  }
+
+  /// Prints the extension needed to make allow upcalls from Swift to Java for protocols
+  private func printSwiftInterfaceWrapper(
+    _ printer: inout SwiftPrinter,
+    _ translatedWrapper: JavaInterfaceSwiftWrapper,
+  ) throws {
+    let inheritedWrappers = self.inheritedProtocols(of: translatedWrapper.importedType).compactMap { self.interfaceProtocolWrappers[$0] }
+    let inheritedTypes = [translatedWrapper.swiftName] + inheritedWrappers.map(\.wrapperName)
+
+    printer.printBraceBlock("protocol \(translatedWrapper.wrapperName): \(inheritedTypes.joined(separator: .comma))") { printer in
+      printer.print(
+        "var \(translatedWrapper.javaInterfaceVariableName): \(translatedWrapper.javaInterfaceName) { get }"
+      )
+    }
+    printer.println()
+    try printer.printBraceBlock("extension \(translatedWrapper.wrapperName)") { printer in
+      for inherited in inheritedWrappers {
+        printer.printBraceBlock("var \(inherited.javaInterfaceVariableName): \(inherited.javaInterfaceName)") { printer in
+          printer.print("\(translatedWrapper.javaInterfaceVariableName)")
+        }
+        printer.println()
+      }
+
+      for function in translatedWrapper.functions {
+        try printInterfaceWrapperFunctionImpl(&printer, function, inside: translatedWrapper)
+        printer.println()
+      }
+
+      // FIXME: Add support for protocol variables https://github.com/swiftlang/swift-java/issues/457
+      //      for variable in translatedWrapper.variables {
+      //        printerInterfaceWrapperVariable(&printer, variable, inside: translatedWrapper)
+      //        printer.println()
+      //      }
+    }
+  }
+
+  private func printInterfaceWrapperFunctionImpl(
+    _ printer: inout SwiftPrinter,
+    _ function: JavaInterfaceSwiftWrapper.Function,
+    inside wrapper: JavaInterfaceSwiftWrapper,
+  ) throws {
+    guard
+      let protocolMethod = wrapper.importedType.methods.first(where: {
+        $0.functionSignature == function.originalFunctionSignature
+      })
+    else {
+      fatalError("Failed to find protocol method")
+    }
+    guard let translatedDecl = self.translatedDecl(for: protocolMethod) else {
+      throw JavaTranslationError.protocolWasNotExtracted
+    }
+
+    printer.printBraceBlock(function.swiftDecl.signatureString) { printer in
+      let resultType = function.originalFunctionSignature.result.type
+      let returnStmt = !resultType.isVoid ? "return " : ""
+      // If the protocol function is non-throwing, we have no option but to force try.
+      // The error thrown by `withLocalFrame` is an OOM error anyway.
+      let withLocalFrameTryKeyword = function.originalFunctionSignature.isThrowing ? "try" : "try!"
+
+      // Push a local JNI frame so refs created during this upcall are freed on exit.
+      // When called from a Swift async context (e.g. cooperative thread pool) there is
+      // no enclosing JNI frame, so refs would otherwise accumulate indefinitely. When
+      // called from a Java-initiated native call there is already a frame, but pushing
+      // a sub-frame still frees refs earlier and prevents overflow within a single call.
+      let paramCount = function.originalFunctionSignature.parameters.count
+      let estimatedRefCount = paramCount * 2 + 4
+      printer.print("let environment$ = try! JavaVirtualMachine.shared().environment()")
+      printer.printBraceBlock("\(returnStmt)\(withLocalFrameTryKeyword) environment$.withLocalFrame(capacity: \(estimatedRefCount))") { printer in
+        var upcallArguments = zip(
+          function.originalFunctionSignature.parameters,
+          function.parameterConversions,
+        ).map { param, conversion in
+          // Wrap-java does not extract parameter names, so no labels
+          conversion.render(&printer, param.parameterName!)
+        }
+
+        // If the underlying translated method requires
+        // a SwiftArena, we pass in the global arena
+        if translatedDecl.translatedFunctionSignature.requiresSwiftArena {
+          upcallArguments.append("JavaSwiftArena.defaultAutoArena")
+        }
+
+        let tryClause = function.originalFunctionSignature.isThrowing ? "try " : ""
+        let javaUpcall =
+          "\(tryClause)\(wrapper.javaInterfaceVariableName).\(function.swiftFunctionName)(\(upcallArguments.joined(separator: .comma)))"
+
+        let result = function.resultConversion.render(&printer, javaUpcall)
+        printer.print("\(returnStmt)\(result)")
+      }
+    }
+  }
+
+  private func printerInterfaceWrapperVariable(
+    _ printer: inout SwiftPrinter,
+    _ variable: JavaInterfaceSwiftWrapper.Variable,
+    inside wrapper: JavaInterfaceSwiftWrapper,
+  ) {
+    // FIXME: Add support for variables. This won't get printed yet
+    // so we no need to worry about fatalErrors.
+    printer.printBraceBlock(variable.swiftDecl.signatureString) { printer in
+      printer.printBraceBlock("get") { printer in
+        printer.print("fatalError()")
+      }
+
+      if variable.setter != nil {
+        printer.printBraceBlock("set") { printer in
+          printer.print("fatalError()")
+        }
+      }
+    }
+  }
+
+  private func printGlobalSwiftThunkSources(_ printer: inout SwiftPrinter) throws {
+    printHeader(&printer)
+
+    self.currentJavaIdentifiers = JavaIdentifierFactory(
+      self.analysis.extractedGlobalFuncs + self.analysis.extractedGlobalVariables
+    )
+
+    for decl in analysis.extractedGlobalFuncs {
+      printSwiftFunctionThunk(&printer, decl)
+      printer.println()
+    }
+
+    for decl in analysis.extractedGlobalVariables {
+      printSwiftFunctionThunk(&printer, decl)
+      printer.println()
+    }
+  }
+
+  private func printNominalTypeThunks(_ printer: inout SwiftPrinter, _ type: ExtractedNominalType) throws {
+    printHeader(&printer)
+    printer.println()
+
+    self.currentJavaIdentifiers = JavaIdentifierFactory(
+      type.initializers + type.variables + type.methods
+    )
+
+    switch type.swiftNominal.kind {
+    case .actor, .class, .enum, .struct:
+      printConcreteTypeThunks(&printer, type)
+    case .protocol:
+      try printProtocolThunks(&printer, type)
+    }
+  }
+
+  private func printConcreteTypeThunks(_ printer: inout SwiftPrinter, _ type: ExtractedNominalType) {
+    // Specialized types are treated as concrete even if the underlying Swift type is generic
+    let isEffectivelyGeneric = type.swiftNominal.isGeneric && !type.isSpecialization
+
+    if isEffectivelyGeneric {
+      printOpenerProtocol(&printer, type)
+      printer.println()
+    }
+
+    for initializer in type.initializers {
+      printSwiftFunctionThunk(&printer, initializer)
+      printer.println()
+    }
+
+    if type.swiftNominal.kind == .enum {
+      printEnumRawDiscriminator(&printer, type)
+      printer.println()
+
+      if !isEffectivelyGeneric {
+        for enumCase in type.cases {
+          printEnumCase(&printer, type, enumCase)
+          printer.println()
+        }
+      }
+    }
+
+    for method in type.methods {
+      printSwiftFunctionThunk(&printer, method)
+      printer.println()
+    }
+
+    for variable in type.variables {
+      printSwiftFunctionThunk(&printer, variable)
+      printer.println()
+    }
+
+    let isNeverLike = type.swiftNominal.kind == .enum && type.cases.isEmpty // Never types cannot be values, so ignore them
+    if !type.isSpecialization && !isNeverLike {
+      printJNICache(&printer, type)
+      printer.println()
+      printNominalJavaBridge(&printer, type)
+      printer.println()
+
+      if self.isSwiftErrorType(type) && !self.inheritsThrowableErrorConformance(type) {
+        printThrowableErrorConformance(&printer, type)
+        printer.println()
+      }
+    }
+
+    printSpecificTypeThunks(&printer, type)
+    printTypeMetadataAddressThunk(&printer, type)
+    printer.println()
+  }
+
+  private func printProtocolThunks(_ printer: inout SwiftPrinter, _ type: ExtractedNominalType) throws {
+    if let protocolWrapper = self.interfaceProtocolWrappers[type] {
+      try printSwiftInterfaceWrapper(&printer, protocolWrapper)
+    }
+
+    // Independent of `interfaceProtocolWrappers`/`enableJavaCallbacks` — this
+    // is the opposite direction (Swift-implements / Java-receives a
+    // downcall), so it must not be gated on the upcall machinery.
+    if self.existentialProtocolBoxes.contains(type) {
+      printExistentialBoxDispatchThunks(&printer, type)
+    }
+  }
+
+  /// Prints one `@_cdecl` dispatch thunk per requirement of a protocol
+  /// that's returned as `any P` / `some P` from at least one extracted
+  /// function (including requirements inherited from refined protocols).
+  private func printExistentialBoxDispatchThunks(_ printer: inout SwiftPrinter, _ type: ExtractedNominalType) {
+    let boxParentName = SwiftQualifiedTypeName(type.swiftNominal.javaExistentialBoxName)
+
+    for method in self.allProtocolRequirementMethods(of: type) {
+      guard var translated = try? self.javaTranslator.translate(method) else {
+        self.logger.debug("Failed to translate protocol requirement for existential box dispatch thunk: \(method)")
+        continue
+      }
+      translated.parentName = boxParentName
+
+      printCDecl(&printer, translated) { printer in
+        self.printFunctionDowncall(&printer, method)
+      }
+      printer.println()
+    }
+  }
+
+  private func printEnumRawDiscriminator(_ printer: inout SwiftPrinter, _ type: ExtractedNominalType) {
+    if type.cases.isEmpty {
+      return
+    }
+
+    printer.printBraceBlock("extension \(type.effectiveSwiftTypeName): _RawDiscriminatorRepresentable") { printer in
+      printer.printBraceBlock("public var _rawDiscriminator: Int32") { printer in
+        printer.printBraceBlock("switch self") { printer in
+          for (idx, enumCase) in type.cases.enumerated() {
+            printer.print("case .\(enumCase.name): return \(idx)")
+          }
+        }
+      }
+    }
+  }
+
+  private func printEnumCase(_ printer: inout SwiftPrinter, _ enumType: ExtractedNominalType, _ enumCase: ExtractedEnumCase) {
+    guard let translatedCase = self.translatedEnumCase(for: enumCase) else {
+      return
+    }
+
+    // Print static case initializer
+    printSwiftFunctionThunk(&printer, enumCase.caseFunction)
+    printer.println()
+
+    printEnumGetAsCaseThunk(&printer, enumType, translatedCase)
+  }
+
+  private func renderJNICacheInit(className: String, methods: [(String, MethodSignature)]) -> String {
+    let fullClassName = "\(javaPackagePath)/\(className)"
+    let methods = methods.map { name, signature in
+      #".init(name: "\#(name)", signature: "\#(signature.mangledName)")"#
+    }.joined(separator: ",\n")
+
+    return #"_JNIMethodIDCache(className: "\#(fullClassName)", methods: [\#(methods)])"#
+  }
+
+  private func printEnumGetAsCaseThunk(
+    _ printer: inout SwiftPrinter,
+    _ enumType: ExtractedNominalType,
+    _ enumCase: TranslatedEnumCase,
+  ) {
+    if let getAsCaseFunction = enumCase.getAsCaseFunction {
+      printer.printBraceBlock("extension \(enumType.effectiveSwiftTypeName)") { printer in
+        let associatedValueTypes = enumCase.original.parameters.map { param in
+          param.type.description
+        }.joined(separator: .comma)
+        printer.printBraceBlock("fileprivate func getAs\(enumCase.name)() -> (\(associatedValueTypes))?") { printer in
+          let params = enumCase.original.parameters.enumerated().map { i, param in
+            (param.name ?? "_\(i)").javaSafeIdentifier
+          }.joined(separator: .comma)
+          printer.printIfBlock("case let .\(enumCase.original.name)(\(params)) = self") { printer in
+            printer.print("return (\(params))")
+          }
+          printer.print("return nil")
+        }
+      }
+
+      printSwiftFunctionThunk(&printer, getAsCaseFunction)
+    }
+  }
+
+  private func printSwiftFunctionThunk(
+    _ printer: inout SwiftPrinter,
+    _ decl: ExtractedFunc,
+  ) {
+    guard let translatedDecl = translatedDecl(for: decl) else {
+      // Failed to translate. Skip.
+      return
+    }
+
+    printAllSwiftFunctionHelperClasses(&printer, decl)
+
+    printCDecl(
+      &printer,
+      translatedDecl,
+    ) { printer in
+      if let parent = decl.parentType?.asNominalType, parent.hasGenericParameter {
+        self.printFunctionOpenerCall(&printer, decl)
+      } else {
+        self.printFunctionDowncall(&printer, decl)
+      }
+    }
+  }
+
+  private func printAllSwiftFunctionHelperClasses(
+    _ printer: inout SwiftPrinter,
+    _ decl: ExtractedFunc,
+  ) {
+    // Emit the `@JavaInterface` Swift wrappers for any `@escaping` closure parameters.
+    if let translatedDecl = translatedDecl(for: decl) {
+      printEscapingClosureSwiftFunctionHelperClasses(&printer, translatedDecl)
+    }
+
+    // Emit the `@JavaInterface` Swift wrappers any existential / protocol parameters.
+    printProtocolParameterSwiftFunctionHelperClasses(&printer, decl)
+  }
+
+  /// Emits Swift wrapper types for any parameter type that is a protocol
+  /// (or a `some`/`any`/generic constraint bound to protocols).
+  private func printProtocolParameterSwiftFunctionHelperClasses(
+    _ printer: inout SwiftPrinter,
+    _ decl: ExtractedFunc,
+  ) {
+    let protocolParameters = decl.functionSignature.parameters.compactMap { parameter in
+      if let concreteType = parameter.type.typeIn(
+        genericParameters: decl.functionSignature.genericParameters,
+        genericRequirements: decl.functionSignature.genericRequirements,
+      ) {
+        return (parameter, concreteType)
+      }
+
+      switch parameter.type {
+      case .opaque(let protocolType),
+        .existential(let protocolType):
+        return (parameter, protocolType)
+
+      default:
+        return nil
+      }
+    }.map { parameter, protocolType in
+      // We flatten any composite types
+      switch protocolType {
+      case .composite(let protocols):
+        return (parameter, protocols)
+
+      default:
+        return (parameter, [protocolType])
+      }
+    }
+
+    // For each parameter that is a generic or a protocol,
+    // we generate a Swift class that conforms to all of those.
+    for (parameter, protocolTypes) in protocolParameters {
+      let protocolWrappers: [JavaInterfaceSwiftWrapper] = protocolTypes.compactMap { protocolType in
+        guard let importedType = self.asExtractedNominalTypeDecl(protocolType),
+          let wrapper = self.interfaceProtocolWrappers[importedType]
+        else {
+          return nil
+        }
+        return wrapper
+      }
+
+      // Make sure we can generate wrappers for all the protocols
+      // that the parameter requires
+      guard protocolWrappers.count == protocolTypes.count else {
+        // We cannot extract a wrapper for this class
+        // so it must only be passed in by JExtract instances
+        continue
+      }
+
+      guard let parameterName = parameter.parameterName else {
+        // TODO: Throw
+        fatalError()
+      }
+      let swiftClassName = JNISwift2JavaGenerator.protocolParameterWrapperClassName(
+        methodName: decl.name,
+        parameterName: parameterName,
+        parentName: decl.parentType?.asNominalType?.nominalTypeDecl.qualifiedTypeName ?? SwiftQualifiedTypeName(swiftModuleName),
+      )
+      let implementingProtocols = protocolWrappers.map(\.wrapperName).joined(separator: .comma)
+
+      printer.printBraceBlock("final class \(swiftClassName): \(implementingProtocols)") { printer in
+        let variables: [(String, String)] = protocolWrappers.map { wrapper in
+          (wrapper.javaInterfaceVariableName, wrapper.javaInterfaceName)
+        }
+        for (name, type) in variables {
+          printer.print("let \(name): \(type)")
+        }
+        printer.println()
+        let initializerParameters = variables.map { "\($0): \($1)" }.joined(separator: .comma)
+
+        printer.printBraceBlock("init(\(initializerParameters))") { printer in
+          for (name, _) in variables {
+            printer.print("self.\(name) = \(name)")
+          }
+        }
+      }
+    }
+  }
+
+  private func asExtractedNominalTypeDecl(_ type: SwiftType) -> ExtractedNominalType? {
+    self.analysis.extractedTypes.first(
+      where: ({ name, nominalType in
+        nominalType.swiftType == type
+      })
+    ).map {
+      $0.value
+    }
+  }
+
+  private func printFunctionDowncall(
+    _ printer: inout SwiftPrinter,
+    _ decl: ExtractedFunc,
+  ) {
+    guard let translatedDecl = self.translatedDecl(for: decl) else {
+      fatalError("Cannot print function downcall for a function that can't be translated: \(decl)")
+    }
+    let nativeSignature = translatedDecl.nativeFunctionSignature
+
+    let tryClause: String = decl.isThrowing ? "try " : ""
+
+    // Regular parameters.
+    var arguments: [String] = [String]()
+    var indirectVariables: [(name: String, lowered: String)] = []
+    var int32OverflowChecks: [String] = []
+
+    for (idx, parameter) in nativeSignature.parameters.enumerated() {
+      let javaParameterName = translatedDecl.translatedFunctionSignature.parameters[idx].parameter.name
+      let lowered = parameter.conversion.render(&printer, javaParameterName)
+      arguments.append(lowered)
+
+      parameter.indirectConversion.flatMap {
+        indirectVariables.append((javaParameterName, $0.render(&printer, javaParameterName)))
+      }
+
+      switch parameter.conversionCheck {
+      case .check32BitIntOverflow:
+        int32OverflowChecks.append(
+          parameter.conversionCheck!.render(
+            &printer,
+            JNISwift2JavaGenerator.indirectVariableName(for: javaParameterName),
+          )
+        )
+      case nil:
+        break
+      }
+    }
+
+    // Make indirect variables
+    for (name, lowered) in indirectVariables {
+      printer.print("let \(JNISwift2JavaGenerator.indirectVariableName(for: name)) = \(lowered)")
+    }
+
+    if !int32OverflowChecks.isEmpty {
+      printer.print("#if _pointerBitWidth(_32)")
+
+      for check in int32OverflowChecks {
+        printer.printGuardBlock(check) { printer in
+          printer.print("environment.throwJavaException(javaException: .integerOverflow)")
+          printer.print(dummyReturn(for: nativeSignature))
+        }
+      }
+      printer.print("#endif")
+    }
+
+    // A setter accessor dispatched on a protocol `self`
+    // cannot reuse the generic callee/result machinery below:
+    // nativeSignature.selfParameter's conversion
+    // (`extractSwiftProtocolValue`) reconstructs `self` by loading the
+    // concrete value out of the existential's storage into a let.
+    // Even if it were mutable, mutating a loaded
+    // existential only mutates a copy for value types. Instead, open the
+    // existential, mutate it, and store the mutated existential back into
+    // the original storage.
+    if decl.apiKind == .setter,
+      case .instance = decl.functionSignature.selfParameter,
+      let protocolType = decl.functionSignature.selfParameter?.selfType.asNominalType,
+      protocolType.isProtocol
+    {
+      guard let newValueArgument = arguments.first else {
+        fatalError("Setter did not contain newValue parameter: \(decl)")
+      }
+      printExistentialBoxSetterDowncall(
+        &printer,
+        decl,
+        protocolType: protocolType,
+        newValueArgument: newValueArgument,
+      )
+      return
+    }
+
+    // Callee
+    let callee: String =
+      switch decl.functionSignature.selfParameter {
+      case .instance:
+        nativeSignature.selfParameter!.conversion.render(
+          &printer,
+          "selfPointer",
+        )
+      case .staticMethod(let selfType), .classMethod(let selfType), .initializer(let selfType):
+        "\(selfType)"
+      case .none:
+        swiftModuleName
+      }
+
+    // Build the result
+    let result: String
+    switch decl.apiKind {
+    case .function, .initializer:
+      let downcallArguments = zip(
+        decl.functionSignature.parameters,
+        arguments,
+      ).map { originalParam, argument in
+        let label = originalParam.argumentLabel.map { "\($0): " } ?? ""
+        return "\(label)\(argument)"
+      }
+      .joined(separator: .comma)
+      result = "\(tryClause)\(callee).\(decl.name)(\(downcallArguments))"
+    case .binaryOperator:
+      precondition(arguments.count == 2, "Binary operator must have exactly 2 arguments: \(decl)")
+      result = "(\(tryClause)((\(arguments.first!)) \(decl.name) (\(arguments.last!))))"
+    case .prefixOperator:
+      precondition(arguments.count == 1, "Prefix operator must have exactly 1 argument: \(decl)")
+      result = "(\(tryClause)(\(decl.name) (\(arguments.first!))))"
+    case .postfixOperator:
+      precondition(arguments.count == 1, "Postfix operator must have exactly 1 argument: \(decl)")
+      result = "(\(tryClause)((\(arguments.first!)) \(decl.name)))"
+    case .enumCase:
+      let downcallArguments = zip(
+        decl.functionSignature.parameters,
+        arguments,
+      ).map { originalParam, argument in
+        let label = originalParam.argumentLabel.map { "\($0): " } ?? ""
+        return "\(label)\(argument)"
+      }
+
+      let associatedValues = !downcallArguments.isEmpty ? "(\(downcallArguments.joined(separator: .comma)))" : ""
+      result = "\(callee).\(decl.name)\(associatedValues)"
+
+    case .getter:
+      result = "\(tryClause)\(callee).\(decl.name)"
+
+    case .setter:
+      guard let newValueArgument = arguments.first else {
+        fatalError("Setter did not contain newValue parameter: \(decl)")
+      }
+
+      result = "\(callee).\(decl.name) = \(newValueArgument)"
+    case .subscriptGetter:
+      let parameters = zip(
+        decl.functionSignature.parameters,
+        arguments,
+      ).map { originalParam, argument in
+        let label = originalParam.argumentLabel.map { "\($0): " } ?? ""
+        return "\(label)\(argument)"
+      }
+      .joined(separator: .comma)
+      result = "\(callee)[\(parameters)]"
+    case .subscriptSetter:
+      guard let newValueArgument = arguments.last else {
+        fatalError("Setter did not contain newValue parameter: \(decl)")
+      }
+
+      // Drop the trailing newValue parameter — it's the right-hand-side of
+      // the assignment, not part of the bracketed index expression
+      let indexParams = decl.functionSignature.parameters.dropLast()
+      let indexArgs = arguments.dropLast()
+
+      let parameters = zip(indexParams, indexArgs).map { originalParam, argument in
+        let label = originalParam.argumentLabel.map { "\($0): " } ?? ""
+        return "\(label)\(argument)"
+      }
+      .joined(separator: .comma)
+      result = "\(callee)[\(parameters)] = \(newValueArgument)"
+    }
+
+    // Lower the result.
+    func innerBody(in printer: inout SwiftPrinter) -> String {
+      let loweredResult = nativeSignature.result.conversion.render(&printer, result)
+
+      if !decl.functionSignature.result.type.isVoid {
+        return "return \(loweredResult)"
+      } else {
+        return loweredResult
+      }
+    }
+
+    if decl.isThrowing, !(decl.isAsync || decl.isIsolated || decl.isImplicitlyAsync) {
+      printer.print("do {")
+      printer.indent()
+      printer.print(innerBody(in: &printer))
+      printer.outdent()
+      printer.print("} catch {")
+      printer.indent()
+      printer.print(
+        """
+        environment.throwSwiftErrorAsJava(error)
+        \(dummyReturn(for: nativeSignature))
+        """
+      )
+      printer.outdent()
+      printer.print("}")
+    } else {
+      printer.print(innerBody(in: &printer))
+    }
+  }
+
+  private func dummyReturn(for nativeSignature: NativeFunctionSignature) -> String {
+    "return \(nativeSignature.result.javaType.swiftJniPlaceholderExpr)"
+  }
+
+  /// Prints the body of an existential box's setter thunk.
+  private func printExistentialBoxSetterDowncall(
+    _ printer: inout SwiftPrinter,
+    _ decl: ExtractedFunc,
+    protocolType: SwiftNominalType,
+    newValueArgument: String,
+  ) {
+    // We need to do a "load-mutate-store" flow, because
+    // the underlying type could be a struct, so we cannot mutate that in place.
+
+    let existentialType = SwiftKitPrinting.renderExistentialType([protocolType])
+    let selfName = "selfPointer"
+
+    printer.print(
+      """
+      guard let \(selfName)TypeMetadataPointer$ = UnsafeRawPointer(bitPattern: Int(Int64(fromJNI: selfTypePointer, in: environment))) else {
+        fatalError("selfTypePointer memory address was null")
+      }
+      let \(selfName)DynamicType$: Any.Type = unsafeBitCast(\(selfName)TypeMetadataPointer$, to: Any.Type.self)
+      guard let \(selfName)RawPointer$ = UnsafeMutableRawPointer(bitPattern: Int(Int64(fromJNI: \(selfName), in: environment))) else {
+        fatalError("\(selfName) memory address was null")
+      }
+      #if hasFeature(ImplicitOpenExistentials)
+      var \(selfName)Existential$: \(existentialType) = \(selfName)RawPointer$.load(as: \(selfName)DynamicType$) as! \(existentialType)
+      \(selfName)Existential$.\(decl.name) = \(newValueArgument)
+      func \(selfName)DoStore$<Ty>(_ value: Ty) {
+        \(selfName)RawPointer$.assumingMemoryBound(to: Ty.self).pointee = value
+      }
+      \(selfName)DoStore$(\(selfName)Existential$)
+      #else
+      func \(selfName)DoSet$<Ty>(_ ty: Ty.Type) {
+        let typed$ = \(selfName)RawPointer$.assumingMemoryBound(to: Ty.self)
+        var existential$: \(existentialType) = typed$.pointee as! \(existentialType)
+        existential$.\(decl.name) = \(newValueArgument)
+        typed$.pointee = existential$ as! Ty
+      }
+      _openExistential(\(selfName)DynamicType$, do: \(selfName)DoSet$)
+      #endif
+      """
+    )
+  }
+
+  private func printCDecl(
+    _ printer: inout SwiftPrinter,
+    _ translatedDecl: TranslatedFunctionDecl,
+    _ body: (inout SwiftPrinter) -> Void,
+  ) {
+    let nativeSignature = translatedDecl.nativeFunctionSignature
+    var parameters = nativeSignature.parameters.flatMap(\.parameters)
+
+    if let selfParameter = nativeSignature.selfParameter {
+      parameters += selfParameter.parameters
+    }
+    if let selfTypeParameter = nativeSignature.selfTypeParameter {
+      parameters += selfTypeParameter.parameters
+    }
+    parameters += nativeSignature.result.outParameters
+
+    printCDecl(
+      &printer,
+      javaMethodName: translatedDecl.nativeFunctionName,
+      parentName: translatedDecl.parentName,
+      parameters: parameters,
+      resultType: nativeSignature.result.javaType,
+    ) { printer in
+      body(&printer)
+    }
+  }
+
+  private func printCDecl(
+    _ printer: inout SwiftPrinter,
+    javaMethodName: String,
+    parentName: SwiftQualifiedTypeName,
+    parameters: [JavaParameter],
+    resultType: JavaType,
+    _ body: (inout SwiftPrinter) -> Void,
+  ) {
+    let jniSignature = parameters.reduce(into: "") { signature, parameter in
+      signature += parameter.type.jniTypeSignature
+    }
+
+    let cName = String.jniSymbolName(
+      package: self.javaPackage,
+      parent: parentName,
+      method: javaMethodName,
+      signature: jniSignature,
+    )
+
+    self.generatedCDeclSymbolNames.append(cName)
+
+    let translatedParameters = parameters.map {
+      "\($0.name): \($0.type.jniTypeName)"
+    }
+
+    let thunkParameters =
+      [
+        "environment: UnsafeMutablePointer<JNIEnv?>!",
+        "thisClass: jclass",
+      ] + translatedParameters
+    let thunkReturnType = resultType != .void ? " -> \(resultType.jniTypeName)" : ""
+
+    // TODO: Think about function overloads
+    printer.printBraceBlock(
+      """
+      #if compiler(>=6.3)
+      @used
+      #endif
+      #if compiler(>=6.4)
+      @diagnose(DeprecatedDeclaration, as: ignored)
+      #endif
+      @_cdecl("\(cName)")
+      public func \(cName)(\(thunkParameters.joined(separator: .comma)))\(thunkReturnType)
+      """
+    ) { printer in
+      body(&printer)
+    }
+  }
+
+  private func printJNICache(_ printer: inout SwiftPrinter, _ type: ExtractedNominalType) {
+    let cacheName = JNICaching.cacheName(for: type)
+    let jniClassName = "\(javaPackagePath)/\(type.effectiveJavaTypeName.jniEscapedName)"
+    let isEffectivelyGeneric = type.swiftNominal.isGeneric && type.effectiveJavaTypeName == type.swiftNominal.qualifiedTypeName
+    let signature =
+      if isEffectivelyGeneric {
+        "(JJLorg/swift/swiftkit/core/SwiftArena;)L\(jniClassName);"
+      } else {
+        "(JLorg/swift/swiftkit/core/SwiftArena;)L\(jniClassName);"
+      }
+
+    printer.printBraceBlock("private enum \(cacheName)") { printer in
+      printer.print(
+        """
+        private static let wrapMemoryAddressUnsafeMethod = _JNIMethodIDCache.Method(
+          name: "wrapMemoryAddressUnsafe",
+          signature: "\(signature)",
+          isStatic: true
+        )
+
+        private static let cache = _JNIMethodIDCache(
+          className: "\(jniClassName)",
+          methods: [wrapMemoryAddressUnsafeMethod]
+        )
+
+        static var javaClass: jclass {
+          cache.javaClass
+        }
+
+        static var wrapMemoryAddressUnsafe: jmethodID {
+          cache[wrapMemoryAddressUnsafeMethod]!
+        }
+        """
+      )
+    }
+  }
+
+  /// Prints the `_JNIThrowableError` conformance that lets the runtime throw this error as its generated Java class.
+  private func printThrowableErrorConformance(_ printer: inout SwiftPrinter, _ type: ExtractedNominalType) {
+    let bridgeName = JNICaching.bridgeName(for: type)
+    printer.printBraceBlock("extension \(type.effectiveSwiftTypeName): _JNIThrowableError") { printer in
+      printer.printBraceBlock("public func _makeJavaThrowable(in environment: JNIEnvironment) -> jthrowable?") { printer in
+        printer.print("\(bridgeName).toJavaObject(self, in: environment)")
+      }
+    }
+  }
+
+  private func printNominalJavaBridge(_ printer: inout SwiftPrinter, _ type: ExtractedNominalType) {
+    let bridgeName = JNICaching.bridgeName(for: type)
+    let cacheName = JNICaching.cacheName(for: type)
+    let isEffectivelyGeneric = type.swiftNominal.isGeneric && !type.isSpecialization
+    let bridgeGenericClause =
+      if type.swiftNominal.genericParameters.isEmpty {
+        ""
+      } else {
+        "<\(type.swiftNominal.genericParameters.map { $0.syntax.trimmedDescription }.joined(separator: " "))>"
+      }
+    let bridgeWhereClause = type.swiftNominal.genericWhereClause?.trimmedDescription
+    let bridgedSwiftType =
+      if type.genericParameterNames.isEmpty {
+        type.effectiveSwiftTypeName
+      } else {
+        "\(type.baseTypeName)<\(type.swiftNominal.genericParameters.map(\.packExpansionName).joined(separator: .comma))>"
+      }
+    let parentProtocol = isEffectivelyGeneric ? "JextractedGenericTypeBridge" : "JextractedTypeBridge"
+
+    let bridgeDeclaration =
+      if let bridgeWhereClause {
+        "struct \(bridgeName)\(bridgeGenericClause): \(parentProtocol) \(bridgeWhereClause)"
+      } else {
+        "struct \(bridgeName)\(bridgeGenericClause): \(parentProtocol)"
+      }
+
+    printer.printBraceBlock(bridgeDeclaration) { printer in
+      printer.print("typealias SwiftType = \(bridgedSwiftType)")
+      printer.println()
+      printer.printBraceBlock("static var javaClass: jclass") { printer in
+        printer.print("\(cacheName).javaClass")
+      }
+      printer.println()
+      printer.printBraceBlock("static var wrapMemoryAddressUnsafe: jmethodID") { printer in
+        printer.print("\(cacheName).wrapMemoryAddressUnsafe")
+      }
+    }
+  }
+
+  private func printHeader(_ printer: inout SwiftPrinter) {
+    // `public import` so the thunk file remains valid under
+    // `InternalImportsByDefault` (SE-0409)
+    printer.print(
+      """
+      // Generated by swift-java
+
+      #if hasFeature(InternalImportsByDefault)
+      public import SwiftJava
+      public import SwiftJavaJNICore
+      public import SwiftJavaRuntimeSupport
+      #else
+      import SwiftJava
+      import SwiftJavaJNICore
+      import SwiftJavaRuntimeSupport
+      #endif
+      """
+    )
+
+    self.lookupContext.symbolTable.printImportedModules(&printer)
+  }
+
+  private func printTypeMetadataAddressThunk(_ printer: inout SwiftPrinter, _ type: ExtractedNominalType) {
+    // Specialized types are treated as concrete
+    let isEffectivelyGeneric = type.swiftNominal.isGeneric && !type.isSpecialization
+    if isEffectivelyGeneric {
+      return
+    }
+
+    printCDecl(
+      &printer,
+      javaMethodName: "$typeMetadataAddressDowncall",
+      parentName: type.effectiveJavaTypeName,
+      parameters: [],
+      resultType: .long,
+    ) { printer in
+      printer.print(
+        """
+        let metadataPointer = unsafeBitCast(\(type.effectiveSwiftTypeName).self, to: UnsafeRawPointer.self)
+        return Int64(Int(bitPattern: metadataPointer)).getJNIValue(in: environment)
+        """
+      )
+    }
+  }
+
+  /// Prints thunks for specific known types like Foundation.Date, Foundation.Data
+  private func printSpecificTypeThunks(_ printer: inout SwiftPrinter, _ type: ExtractedNominalType) {
+    guard let knownType = type.swiftNominal.knownTypeKind else { return }
+
+    switch knownType {
+    case .foundationData, .essentialsData:
+      printFoundationDataThunks(&printer, type)
+      printer.println()
+
+    default:
+      break
+    }
+  }
+
+  /// Prints Swift thunks for Foundation.Data helper methods
+  private func printFoundationDataThunks(_ printer: inout SwiftPrinter, _ type: ExtractedNominalType) {
+    let selfPointerParam = JavaParameter(name: "selfPointer", type: .long)
+    let parentName = type.qualifiedName
+
+    // Rebind the memory instead of converting, and set the memory directly using 'jniSetArrayRegion' from the buffer
+    printCDecl(
+      &printer,
+      javaMethodName: "$toByteArray",
+      parentName: type.effectiveJavaTypeName,
+      parameters: [
+        selfPointerParam
+      ],
+      resultType: .array(.byte),
+    ) { printer in
+      let selfVar = self.printSelfJLongToUnsafeMutablePointer(&printer, swiftParentName: parentName, selfPointerParam)
+
+      printer.print(
+        """
+        return \(selfVar).pointee.withUnsafeBytes { buffer in
+          return buffer.getJNIValue(in: environment)
+        }
+        """
+      )
+    }
+
+    // Legacy API, also to compare with as a baseline, we could remove it
+    printCDecl(
+      &printer,
+      javaMethodName: "$toByteArrayIndirectCopy",
+      parentName: type.effectiveJavaTypeName,
+      parameters: [
+        selfPointerParam
+      ],
+      resultType: .array(.byte),
+    ) { printer in
+      let selfVar = self.printSelfJLongToUnsafeMutablePointer(&printer, swiftParentName: parentName, selfPointerParam)
+
+      printer.print(
+        """
+        // This is a double copy, we need to initialize the array and then copy into a JVM array in getJNIValue
+        return [UInt8](\(selfVar).pointee).getJNIValue(in: environment)
+        """
+      )
+    }
+  }
+
+  private func printFunctionOpenerCall(_ printer: inout SwiftPrinter, _ decl: ExtractedFunc) {
+    guard let translatedDecl = self.translatedDecl(for: decl) else {
+      fatalError("Cannot print function opener for a function that can't be translated: \(decl)")
+    }
+    guard let parentNominalType = decl.parentType?.asNominalType else {
+      fatalError("Only functions with nominal type parents can have openers")
+    }
+    let nativeSignature = translatedDecl.nativeFunctionSignature
+
+    let selfType = nativeSignature.selfTypeParameter!.conversion.render(&printer, "selfTypePointer")
+    let openerName = openerProtocolName(for: parentNominalType.nominalTypeDecl)
+    printer.print("let openerType = \(selfType) as! (any \(openerName).Type)")
+
+    var parameters = nativeSignature.parameters.flatMap(\.parameters)
+    if let selfParameter = nativeSignature.selfParameter {
+      parameters += selfParameter.parameters
+    }
+    parameters += nativeSignature.result.outParameters
+
+    let openerArguments =
+      [
+        "environment: environment",
+        "thisClass: thisClass",
+      ]
+      + parameters.map { javaParameter in
+        "\(javaParameter.name): \(javaParameter.name)"
+      }
+    let call = "openerType.\(decl.openerMethodName)(\(openerArguments.joined(separator: .comma)))"
+
+    if !decl.functionSignature.result.type.isVoid {
+      printer.print("return \(call)")
+    } else {
+      printer.print(call)
+    }
+  }
+
+  private func openerProtocolName(for type: SwiftNominalTypeDeclaration) -> String {
+    "_\(swiftModuleName)_\(type.flatName)_opener"
+  }
+
+  private func printOpenerProtocol(_ printer: inout SwiftPrinter, _ type: ExtractedNominalType) {
+    let protocolName = openerProtocolName(for: type.swiftNominal)
+
+    func printFunctionDecl(_ printer: inout SwiftPrinter, decl: ExtractedFunc, skipMethodBody: Bool) {
+      guard let translatedDecl = self.translatedDecl(for: decl) else { return }
+      let nativeSignature = translatedDecl.nativeFunctionSignature
+
+      var parameters = nativeSignature.parameters.flatMap(\.parameters)
+      if let selfParameter = nativeSignature.selfParameter {
+        parameters += selfParameter.parameters
+      }
+      parameters += nativeSignature.result.outParameters
+
+      let resultType = nativeSignature.result.javaType
+
+      let translatedParameters = parameters.map {
+        "\($0.name): \($0.type.jniTypeName)"
+      }
+
+      let thunkParameters =
+        [
+          "environment: UnsafeMutablePointer<JNIEnv?>!",
+          "thisClass: jclass",
+        ] + translatedParameters
+      let thunkReturnType = resultType != .void ? " -> \(resultType.jniTypeName)" : ""
+
+      let signature = #"static func \#(decl.openerMethodName)(\#(thunkParameters.joined(separator: .comma)))\#(thunkReturnType)"#
+      if !skipMethodBody {
+        printer.printBraceBlock(signature) { printer in
+          printFunctionDowncall(&printer, decl)
+        }
+      } else {
+        printer.print(signature)
+      }
+    }
+
+    printer.printBraceBlock("protocol \(protocolName)") { printer in
+      for variable in type.variables {
+        printFunctionDecl(&printer, decl: variable, skipMethodBody: true)
+      }
+
+      for method in type.methods {
+        printFunctionDecl(&printer, decl: method, skipMethodBody: true)
+      }
+    }
+    printer.println()
+    printer.printBraceBlock("extension \(type.swiftNominal.qualifiedName): \(protocolName)") { printer in
+      for variable in type.variables {
+        printFunctionDecl(&printer, decl: variable, skipMethodBody: false)
+      }
+
+      for method in type.methods {
+        printFunctionDecl(&printer, decl: method, skipMethodBody: false)
+      }
+    }
+  }
+
+  /// Print the necessary conversion logic to go from a `jlong` to a `UnsafeMutablePointer<Type>`
+  ///
+  /// - Returns: name of the created "self" variable
+  private func printSelfJLongToUnsafeMutablePointer(
+    _ printer: inout SwiftPrinter,
+    swiftParentName: String,
+    _ selfPointerParam: JavaParameter,
+  ) -> String {
+    let newSelfParamName = "selfPointer$"
+    printer.print(
+      """
+      guard let env$ = environment else {
+        fatalError("Missing JNIEnv in downcall to \\(#function)")
+      }
+      assert(\(selfPointerParam.name) != 0, "\(selfPointerParam.name) memory address was null")
+      let selfPointerBits$ = Int(Int64(fromJNI: \(selfPointerParam.name), in: env$))
+      guard let \(newSelfParamName) = UnsafeMutablePointer<\(swiftParentName)>(bitPattern: selfPointerBits$) else {
+        fatalError("selfPointer memory address was null in call to \\(#function)!")
+      }
+      """
+    )
+    return newSelfParamName
+  }
+
+  static func protocolParameterWrapperClassName(
+    methodName: String,
+    parameterName: String,
+    parentName: SwiftQualifiedTypeName?,
+  ) -> String {
+    let parent =
+      if let parentName {
+        "\(parentName.fullFlatName)_"
+      } else {
+        ""
+      }
+    return "_\(parent)\(methodName)_\(parameterName)_Wrapper"
+  }
+}
+
+extension SwiftNominalTypeDeclaration {
+  private var safeProtocolName: String {
+    self.flatName
+  }
+
+  /// The name of the corresponding `@JavaInterface` of this type.
+  var javaInterfaceName: String {
+    "Java\(safeProtocolName)"
+  }
+
+  var javaInterfaceSwiftProtocolWrapperName: String {
+    "SwiftJava\(safeProtocolName)Wrapper"
+  }
+
+  var javaInterfaceVariableName: String {
+    "_\(javaInterfaceName.firstCharacterLowercased)Interface"
+  }
+
+  /// The name of the generated Java class that boxes a value returned as
+  /// `any P` / `some P` from a Swift function.
+  var javaExistentialBoxName: String {
+    "\(safeProtocolName)Box"
+  }
+
+  var generatedJavaClassMacroName: String {
+    if let parent {
+      return "\(parent.generatedJavaClassMacroName).Java\(self.name)"
+    }
+
+    return "Java\(self.name)"
+  }
+}
+
+extension ExtractedFunc {
+  fileprivate var openerMethodName: String {
+    let prefix =
+      switch apiKind {
+      case .getter: "_get_"
+      case .setter: "_set_"
+      default: "_"
+      }
+    return "\(prefix)\(name)"
+  }
+}

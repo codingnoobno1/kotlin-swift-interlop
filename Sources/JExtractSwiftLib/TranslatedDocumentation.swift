@@ -1,0 +1,109 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2025 Apple Inc. and the Swift.org project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift.org project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+import CodePrinting
+import SwiftExtract
+import SwiftJavaConfigurationShared
+import SwiftSyntax
+
+enum TranslatedDocumentation {
+  static func printDocumentation(
+    importedFunc: ExtractedFunc,
+    translatedDecl: FFMSwift2JavaGenerator.TranslatedFunctionDecl,
+    config: Configuration,
+    in printer: inout JavaPrinter
+  ) {
+    var documentation = SwiftDocumentationParser.parse(importedFunc.swiftDecl)
+
+    if translatedDecl.translatedSignature.requiresSwiftArena {
+      documentation?.parameters.append(
+        SwiftDocumentation.Parameter(
+          name: "swiftArena",
+          description: "the arena that will manage the lifetime and allocation of Swift objects"
+        )
+      )
+    }
+
+    printDocumentation(documentation, syntax: importedFunc.swiftDecl, config: config, in: &printer)
+  }
+
+  static func printDocumentation(
+    importedFunc: ExtractedFunc,
+    translatedDecl: JNISwift2JavaGenerator.TranslatedFunctionDecl,
+    config: Configuration,
+    in printer: inout JavaPrinter
+  ) {
+    var documentation = SwiftDocumentationParser.parse(importedFunc.swiftDecl)
+
+    if translatedDecl.translatedFunctionSignature.requiresSwiftArena {
+      documentation?.parameters.append(
+        SwiftDocumentation.Parameter(
+          name: "swiftArena",
+          description: "the arena that the the returned object will be attached to"
+        )
+      )
+    }
+
+    printDocumentation(documentation, syntax: importedFunc.swiftDecl, config: config, in: &printer)
+  }
+
+  private static func printDocumentation(
+    _ parsedDocumentation: SwiftDocumentation?,
+    syntax: some DeclSyntaxProtocol,
+    config: Configuration,
+    in printer: inout JavaPrinter
+  ) {
+    var groups = [String]()
+    if let summary = parsedDocumentation?.summary {
+      groups.append("\(summary)")
+    }
+
+    if let discussion = parsedDocumentation?.discussion {
+      let paragraphs = discussion.split(separator: "\n\n")
+      for paragraph in paragraphs {
+        groups.append("<p>\(paragraph)")
+      }
+    }
+
+    let signatureString = syntax.signatureString
+    groups.append(
+      """
+      \(parsedDocumentation != nil ? "<p>" : "")Downcall to Swift:
+      \(config.javadocCodeSnippetStart(lang: "swift"))
+      \(signatureString)
+      \(config.javadocCodeSnippetEnd)
+      """
+    )
+
+    var annotationsGroup = [String]()
+
+    for param in parsedDocumentation?.parameters ?? [] {
+      annotationsGroup.append("@param \(param.name) \(param.description)")
+    }
+
+    if let throwsDescription = parsedDocumentation?.throwsDescription {
+      annotationsGroup.append("@throws Exception \(throwsDescription)")
+    }
+
+    if let returns = parsedDocumentation?.returns {
+      annotationsGroup.append("@return \(returns)")
+    }
+
+    if !annotationsGroup.isEmpty {
+      groups.append(annotationsGroup.joined(separator: "\n"))
+    }
+
+    printer.printJavadocComment(groups.joined(separator: "\n\n"))
+  }
+}

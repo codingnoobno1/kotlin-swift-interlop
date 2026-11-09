@@ -1,0 +1,344 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2024 Apple Inc. and the Swift.org project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift.org project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+import CodePrinting
+import JExtractSwiftLib
+import SwiftExtract
+import SwiftJavaConfigurationShared
+import SwiftParser
+import SwiftSyntax
+import Testing
+
+import struct Foundation.CharacterSet
+
+enum RenderKind {
+  case swift
+  case java
+}
+
+func assertOutput(
+  dump: Bool = false,
+  input: String,
+  config: Configuration? = nil,
+  _ mode: JExtractGenerationMode,
+  _ renderKind: RenderKind,
+  swiftModuleName: String = "SwiftModule",
+  detectChunkByInitialLines _detectChunkByInitialLines: Int = 4,
+  javaClassLookupTable: [String: String] = [:],
+  /// Map of dependency Swift module name to raw Swift source text. Used to seed
+  /// `translator.sourceDependencies` so cross-module type lookups resolve.
+  dependencySwiftSources: [String: String] = [:],
+  /// Map of Swift module name to Java package, mirroring what `--depends-on`
+  /// dependency configs would carry. Forwarded to the generator so cross-module
+  /// type references print with their fully-qualified Java name.
+  moduleJavaPackages: [String: String] = [:],
+  expectedChunks: [String],
+  notExpectedChunks: [String] = [],
+  fileID: String = #fileID,
+  filePath: String = #filePath,
+  line: Int = #line,
+  column: Int = #column
+) throws {
+  var config = config ?? Configuration()
+  config.swiftModule = swiftModuleName
+  let translator = makeSwiftJavaAnalyzer(config: config)
+  translator.sourceDependencies.addJavaWrapperStubs(Array(javaClassLookupTable.keys))
+  for (depModule, depSource) in dependencySwiftSources {
+    let syntax = Parser.parse(source: depSource)
+    let input = SwiftInputFile(syntax: syntax, path: "/fake/\(depModule).swift")
+    translator.sourceDependencies.swiftModuleInputs[depModule] = [input]
+  }
+
+  try! translator.analyze(path: "/fake/Fake.swiftinterface", text: input)
+
+  let output: String
+  switch mode {
+  case .ffm:
+    let generator = FFMSwift2JavaGenerator(
+      config: config,
+      translator: translator,
+      javaPackage: "com.example.swift",
+      swiftOutputDirectory: "/fake",
+      javaOutputDirectory: "/fake"
+    )
+
+    switch renderKind {
+    case .swift:
+      var printer = SwiftPrinter(mode: .accumulateAll)
+      try generator.writeSwiftThunkSources(printer: &printer)
+      output = printer.finalize()
+    case .java:
+      var printer = JavaPrinter(mode: .accumulateAll)
+      try generator.writeExportedJavaSources(printer: &printer)
+      output = printer.finalize()
+    }
+
+  case .jni:
+    let generator = JNISwift2JavaGenerator(
+      config: config,
+      translator: translator,
+      javaPackage: "com.example.swift",
+      swiftOutputDirectory: "/fake",
+      javaOutputDirectory: "/fake",
+      javaClassLookupTable: javaClassLookupTable,
+      moduleJavaPackages: moduleJavaPackages
+    )
+
+    switch renderKind {
+    case .swift:
+      var printer = SwiftPrinter(mode: .accumulateAll)
+      try generator.writeSwiftThunkSources(&printer)
+      output = printer.finalize()
+    case .java:
+      var printer = JavaPrinter(mode: .accumulateAll)
+      try generator.writeExportedJavaSources(&printer)
+      output = printer.finalize()
+    }
+  }
+
+  assertOutput(
+    output,
+    dump: dump,
+    expectedChunks: expectedChunks,
+    notExpectedChunks: notExpectedChunks,
+    detectChunkByInitialLines: _detectChunkByInitialLines,
+    fileID: fileID,
+    filePath: filePath,
+    line: line,
+    column: column
+  )
+}
+
+/// Asserts that `output` contains each of `expectedChunks` and that it contains none of `notExpectedChunks`.
+func assertOutput(
+  _ output: String,
+  dump: Bool = false,
+  expectedChunks: [String],
+  notExpectedChunks: [String] = [],
+  detectChunkByInitialLines _detectChunkByInitialLines: Int = 4,
+  fileID: String = #fileID,
+  filePath: String = #filePath,
+  line: Int = #line,
+  column: Int = #column
+) {
+  let sourceLocation = SourceLocation(fileID: fileID, filePath: filePath, line: line, column: column)
+  for notExpectedChunk in notExpectedChunks {
+    let outputNotContainsNotExpectedChunk = !output.contains(notExpectedChunk)
+    #expect(
+      outputNotContainsNotExpectedChunk,
+      """
+      \("error: Output must not contain not expected chunk!".red)
+      ==== Not Expected output -----------------------------------------------
+      \(notExpectedChunk.yellow)
+      ==== Got output ----------------------------------------------------
+      \(output)
+      ==== ---------------------------------------------------------------
+      """,
+      sourceLocation: sourceLocation
+    )
+  }
+
+  let gotLines = output.split(separator: "\n").filter { l in
+    l.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).count > 0
+  }
+  for expectedChunk in expectedChunks {
+    let expectedLines = expectedChunk.split(separator: "\n")
+    let detectChunkByInitialLines = min(expectedLines.count, _detectChunkByInitialLines)
+    precondition(detectChunkByInitialLines > 0, "Chunk size to detect cannot be zero lines!")
+
+    var matchingOutputOffset: Int? = nil
+    let expectedInitialMatchingLines = expectedLines[0..<min(expectedLines.count, detectChunkByInitialLines)]
+      .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+      .joined(separator: "\n")
+
+    for lineOffset in 0..<gotLines.count where gotLines.count > (lineOffset + detectChunkByInitialLines) {
+      let textLinesAtOffset = gotLines[lineOffset..<lineOffset + detectChunkByInitialLines]
+        .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+        .joined(separator: "\n")
+      if textLinesAtOffset == expectedInitialMatchingLines {
+        matchingOutputOffset = lineOffset
+        break
+      }
+    }
+
+    let sourceLocation = SourceLocation(
+      fileID: fileID,
+      filePath: filePath,
+      line: line,
+      column: column
+    )
+
+    var diffLineNumbers: [Int] = []
+    guard let matchingOutputOffset else {
+      let outputContainsExpectedChunk = output.contains(expectedChunk)
+      #expect(
+        outputContainsExpectedChunk,
+        """
+        \("error: Output did not contain expected chunk!".red)
+        ==== Expected output -----------------------------------------------
+        \(expectedChunk.yellow)
+        ==== Got output ----------------------------------------------------
+        \(output)
+        ==== ---------------------------------------------------------------
+        """,
+        sourceLocation: sourceLocation
+      )
+      continue
+    }
+
+    var currentExpectedLine: Int = 0
+    var currentGotLine: Int = matchingOutputOffset
+
+    outer: while currentExpectedLine < expectedLines.count {
+      let expectedLine = expectedLines[currentExpectedLine].trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+
+      if expectedLine == "..." {
+        // Ignore the rest of output, if last line is placeholder.
+        guard currentExpectedLine != (expectedLines.count - 1) else {
+          break
+        }
+
+        let nextLine = expectedLines[currentExpectedLine + 1].trimmingCharacters(in: .whitespacesAndNewlines)
+        while currentGotLine < gotLines.count {
+          let gottenLine = gotLines[currentGotLine].trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+          if gottenLine.commonPrefix(with: nextLine) == nextLine {
+            currentExpectedLine += 2
+            break
+          } else if nextLine == "..." {
+            // Skip any following "..."
+            currentExpectedLine += 1
+            break
+          } else {
+            currentGotLine += 1
+          }
+
+          if currentGotLine == gotLines.count {
+            diffLineNumbers.append(currentExpectedLine + matchingOutputOffset + 1)
+            Issue.record(
+              "Expected to find '\(nextLine)' after wildcard, but end of file reached.",
+              sourceLocation: sourceLocation
+            )
+            break outer
+          }
+        }
+
+        currentGotLine += 1
+      } else {
+        guard gotLines.count > currentGotLine else {
+          print("WARNING: index out of bounds when asserting text: \(currentGotLine)")
+          print("got lines ======")
+          print(gotLines.joined(separator: "\n").red)
+          currentExpectedLine += 1
+          continue
+        }
+        let gottenLine = gotLines[currentGotLine].trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        if gottenLine.commonPrefix(with: expectedLine) != expectedLine {
+          diffLineNumbers.append(currentExpectedLine + matchingOutputOffset)
+
+          #expect(gottenLine == expectedLine, sourceLocation: sourceLocation)
+        }
+        currentGotLine += 1
+        currentExpectedLine += 1
+      }
+    }
+
+    let hasDiff = diffLineNumbers.count > 0
+    if hasDiff || dump {
+      print("")
+      if hasDiff {
+        print("error: Number of not matching lines: \(diffLineNumbers.count)!".red)
+
+        print("==== Expected output -----------------------------------------------")
+        for (n, e) in expectedLines.enumerated() {
+          let isMismatch = diffLineNumbers.map({ $0 - matchingOutputOffset }).contains(n)
+          let marker = isMismatch ? " // <<<<<<<<<<< mismatch" : ""
+          print("\(n): \(e)\(marker)".yellow(if: isMismatch))
+        }
+      }
+
+      print("==== Got output ----------------------------------------------------")
+      let printFromLineNo = matchingOutputOffset
+      for (n, g) in gotLines.enumerated() where n >= printFromLineNo {
+        let baseLine = "\(n): \(g)"
+        print(baseLine)
+      }
+      print("==== ---------------------------------------------------------------\n")
+    }
+  }
+}
+
+func assertOutput(
+  dump: Bool = false,
+  _ got: String,
+  expected: String,
+  fileID: String = #fileID,
+  filePath: String = #filePath,
+  line: Int = #line,
+  column: Int = #column
+) {
+  let gotLines = got.split(separator: "\n").filter { l in
+    l.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).count > 0
+  }
+  let expectedLines = expected.split(separator: "\n").filter { l in
+    l.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).count > 0
+  }
+
+  var diffLineNumbers: [Int] = []
+
+  for (no, (g, e)) in zip(gotLines, expectedLines).enumerated() {
+    if g.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).count == 0
+      || e.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).count == 0
+    {
+      continue
+    }
+
+    let ge = g.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+    let ee = e.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+    if ge.commonPrefix(with: ee) != ee {
+      diffLineNumbers.append(no)
+
+      let sourceLocation = SourceLocation(
+        fileID: fileID,
+        filePath: filePath,
+        line: line,
+        column: column
+      )
+      #expect(ge == ee, sourceLocation: sourceLocation)
+    }
+
+  }
+
+  let hasDiff = diffLineNumbers.count > 0
+  if hasDiff || dump {
+    print("")
+    if hasDiff {
+      print("error: Number of not matching lines: \(diffLineNumbers.count)!".red)
+
+      print("==== Expected output -----------------------------------------------")
+      for (n, e) in expectedLines.enumerated() {
+        let isMismatch = diffLineNumbers.contains(n)
+        let marker = isMismatch ? " // <<<<<<<< error: mismatch" : ""
+        print("\(e)\(marker)".yellow(if: isMismatch))
+      }
+    }
+
+    print("==== Got output ----------------------------------------------------")
+    for (n, g) in gotLines.enumerated() {
+      let isMismatch = diffLineNumbers.contains(n)
+      let marker = isMismatch ? "// <<<<<<<< error: mismatch" : ""
+      print("\(g)\(marker)".red(if: isMismatch))
+    }
+    print("==== ---------------------------------------------------------------\n")
+  }
+}
