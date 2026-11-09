@@ -23,35 +23,50 @@ jobs:
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Show Swift version
-        run: swift --version
-
       - name: Install JDK 25
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "25"
 
+      - name: Show toolchain
+        run: |
+          swift --version
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version
+
       - name: Build
         run: |
-          set -o pipefail
-          swift build 2>&1 | tee build.log
-          status=${PIPESTATUS[0]}
+          set +e
+          swift build --build-tests --disable-sandbox --disable-experimental-prebuilts > build.log 2>&1
+          status=$?
+          tail -n 40 build.log
           if [ "$status" -ne 0 ]; then
-            tail -c 3500 build.log | awk '{ gsub(/%/,"%25"); gsub(/\r/,"%0D"); printf "%s%%0A", $0 }' > /tmp/ann.txt
-            echo "::error::swift build failed%0A$(cat /tmp/ann.txt)"
-            exit "$status"
+            tail -n 25 build.log | while IFS= read -r line; do
+              line=${line//%/%25}
+              line=${line//$'\r'/%0D}
+              echo "::error::$line"
+            done
           fi
+          exit "$status"
 
       - name: Test issue 915
         run: |
-          set -o pipefail
-          swift test --filter asyncFailurePreservesJavaExceptionCause 2>&1 | tee test.log
-          status=${PIPESTATUS[0]}
-          tail -c 3500 test.log | awk '{ gsub(/%/,"%25"); gsub(/\r/,"%0D"); printf "%s%%0A", $0 }' > /tmp/ann.txt
+          set +e
+          swift test --disable-xctest --disable-experimental-prebuilts --filter asyncFailurePreservesJavaExceptionCause > test.log 2>&1
+          status=$?
+          tail -n 40 test.log
           if [ "$status" -ne 0 ]; then
-            echo "::error::issue 915 test failed%0A$(cat /tmp/ann.txt)"
+            tail -n 25 test.log | while IFS= read -r line; do
+              line=${line//%/%25}
+              line=${line//$'\r'/%0D}
+              echo "::error::$line"
+            done
           else
-            echo "::notice::issue 915 test passed%0A$(cat /tmp/ann.txt)"
+            tail -n 15 test.log | while IFS= read -r line; do
+              line=${line//%/%25}
+              line=${line//$'\r'/%0D}
+              echo "::notice::$line"
+            done
           fi
           exit "$status"
