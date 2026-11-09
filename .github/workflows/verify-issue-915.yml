@@ -16,7 +16,7 @@ jobs:
     name: Build and test async exception preservation
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Swift
         uses: swift-actions/setup-swift@v2
